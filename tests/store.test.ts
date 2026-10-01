@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { createHash } from "node:crypto";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { AgentRegistration, Dirs, MessengerState } from "../lib.ts";
 import {
@@ -11,6 +12,7 @@ import {
   updateRegistration,
   flushActivityToRegistry,
   sendMessageToAgent,
+  stopWatcher,
 } from "../store.ts";
 
 const roots = new Set<string>();
@@ -83,6 +85,7 @@ function writeRegistration(registryDir: string, name: string, cwd: string): void
 }
 
 afterEach(() => {
+  vi.useRealTimers();
   invalidateAgentsCache();
   process.chdir(initialCwd);
   for (const root of roots) {
@@ -157,6 +160,195 @@ describe("store.getActiveAgents cwd scoping", () => {
 });
 
 describe("store.processAllPendingMessages", () => {
+  it("recovers a stale directory lock on the asynchronous retry", () => {
+    vi.useFakeTimers();
+    const root = createTempRoot();
+    const dirs = createDirs(root);
+    const inbox = path.join(dirs.inbox, "Self");
+    const ledger = path.join(dirs.base, "processed", "Self");
+    const lockPath = path.join(ledger, ".lock");
+    fs.mkdirSync(inbox, { recursive: true });
+    fs.mkdirSync(lockPath, { recursive: true });
+    fs.writeFileSync(path.join(lockPath, "owner"), "2147483647:stale-token");
+    fs.writeFileSync(path.join(lockPath, "recovery"), "2147483647:stale-recovery");
+    fs.utimesSync(lockPath, new Date(Date.now() - 20_000), new Date(Date.now() - 20_000));
+    fs.utimesSync(path.join(lockPath, "recovery"), new Date(Date.now() - 20_000), new Date(Date.now() - 20_000));
+    fs.writeFileSync(path.join(inbox, "stale-lock.json"), JSON.stringify({
+      id: "stale-lock-id",
+      from: "Peer",
+      to: "Self",
+      text: "recover me",
+    }));
+
+    const delivered: string[] = [];
+    const state = { agentName: "Self", registered: true } as MessengerState;
+    processAllPendingMessages(state, dirs, msg => delivered.push(msg.id));
+
+    expect(delivered).toEqual([]);
+    expect(fs.existsSync(lockPath)).toBe(false);
+    vi.advanceTimersByTime(10_000);
+
+    expect(delivered).toEqual(["stale-lock-id"]);
+    expect(fs.existsSync(lockPath)).toBe(false);
+  });
+
+  it("does not remove a stale lock with a live recovery winner", () => {
+    vi.useFakeTimers();
+    const root = createTempRoot();
+    const dirs = createDirs(root);
+    const inbox = path.join(dirs.inbox, "Self");
+    const ledger = path.join(dirs.base, "processed", "Self");
+    const lockPath = path.join(ledger, ".lock");
+    fs.mkdirSync(inbox, { recursive: true });
+    fs.mkdirSync(lockPath, { recursive: true });
+    fs.writeFileSync(path.join(lockPath, "owner"), "2147483647:stale-owner");
+    fs.writeFileSync(path.join(lockPath, "recovery"), `${process.pid}:active-recovery`);
+    fs.utimesSync(lockPath, new Date(Date.now() - 20_000), new Date(Date.now() - 20_000));
+    fs.utimesSync(path.join(lockPath, "recovery"), new Date(Date.now() - 20_000), new Date(Date.now() - 20_000));
+
+    processAllPendingMessages(
+      { agentName: "Self", registered: true } as MessengerState,
+      dirs,
+      () => { throw new Error("must not deliver while another owner holds the lock"); },
+    );
+
+    expect(fs.existsSync(lockPath)).toBe(true);
+  });
+
+  it("cancels a lock retry when the watcher stops", () => {
+    vi.useFakeTimers();
+    const root = createTempRoot();
+    const dirs = createDirs(root);
+    const inbox = path.join(dirs.inbox, "Self");
+    const ledger = path.join(dirs.base, "processed", "Self");
+    const lockPath = path.join(ledger, ".lock");
+    fs.mkdirSync(inbox, { recursive: true });
+    fs.mkdirSync(lockPath, { recursive: true });
+    fs.writeFileSync(path.join(lockPath, "owner"), `${process.pid}:other-token`);
+    fs.writeFileSync(path.join(inbox, "stopped.json"), JSON.stringify({
+      id: "stopped-id",
+      from: "Peer",
+      to: "Self",
+      text: "do not retry",
+    }));
+
+    const delivered: string[] = [];
+    const state = { agentName: "Self", registered: true, watcher: null } as MessengerState;
+    processAllPendingMessages(state, dirs, msg => delivered.push(msg.id));
+    stopWatcher(state);
+    fs.rmSync(lockPath, { recursive: true, force: true });
+    vi.advanceTimersByTime(10_000);
+
+    expect(delivered).toEqual([]);
+    expect(fs.existsSync(path.join(inbox, "stopped.json"))).toBe(true);
+  });
+
+  it("does not remove a new owner lock after stale recovery", () => {
+    vi.useFakeTimers();
+    const root = createTempRoot();
+    const dirs = createDirs(root);
+    const inbox = path.join(dirs.inbox, "Self");
+    const ledger = path.join(dirs.base, "processed", "Self");
+    const lockPath = path.join(ledger, ".lock");
+    fs.mkdirSync(inbox, { recursive: true });
+    fs.mkdirSync(lockPath, { recursive: true });
+    fs.writeFileSync(path.join(lockPath, "owner"), "2147483647:stale-token");
+    fs.utimesSync(lockPath, new Date(Date.now() - 20_000), new Date(Date.now() - 20_000));
+
+    const state = { agentName: "Self", registered: true } as MessengerState;
+    processAllPendingMessages(state, dirs, () => { throw new Error("must not deliver"); });
+    fs.mkdirSync(lockPath, { recursive: true });
+    fs.writeFileSync(path.join(lockPath, "owner"), `${process.pid}:new-token`);
+
+    vi.advanceTimersByTime(10_000);
+    expect(fs.readFileSync(path.join(lockPath, "owner"), "utf-8")).toBe(`${process.pid}:new-token`);
+  });
+
+  it("ignores abandoned lock initialization staging when a canonical owner exists", () => {
+    vi.useFakeTimers();
+    const root = createTempRoot();
+    const dirs = createDirs(root);
+    const inbox = path.join(dirs.inbox, "Self");
+    const ledger = path.join(dirs.base, "processed", "Self");
+    const lockPath = path.join(ledger, ".lock");
+    const stagingPath = path.join(ledger, ".lock-start-abandoned");
+    fs.mkdirSync(inbox, { recursive: true });
+    fs.mkdirSync(lockPath, { recursive: true });
+    fs.mkdirSync(stagingPath, { recursive: true });
+    fs.utimesSync(stagingPath, new Date(Date.now() - 20_000), new Date(Date.now() - 20_000));
+    fs.writeFileSync(path.join(lockPath, "owner"), `${process.pid}:canonical-owner`);
+    fs.writeFileSync(path.join(inbox, "staged-lock.json"), JSON.stringify({
+      id: "staged-lock-id",
+      from: "Peer",
+      to: "Self",
+      text: "canonical owner must survive",
+    }));
+
+    const delivered: string[] = [];
+    processAllPendingMessages(
+      { agentName: "Self", registered: true } as MessengerState,
+      dirs,
+      msg => delivered.push(msg.id),
+    );
+
+    expect(delivered).toEqual([]);
+    expect(fs.readFileSync(path.join(lockPath, "owner"), "utf-8")).toBe(`${process.pid}:canonical-owner`);
+    expect(fs.existsSync(stagingPath)).toBe(true);
+  });
+
+  it("keeps a live owner in a stale-looking lock directory", () => {
+    vi.useFakeTimers();
+    const root = createTempRoot();
+    const dirs = createDirs(root);
+    const inbox = path.join(dirs.inbox, "Self");
+    const ledger = path.join(dirs.base, "processed", "Self");
+    const lockPath = path.join(ledger, ".lock");
+    fs.mkdirSync(inbox, { recursive: true });
+    fs.mkdirSync(lockPath, { recursive: true });
+    fs.writeFileSync(path.join(lockPath, "owner"), `${process.pid}:published-owner`);
+    fs.utimesSync(lockPath, new Date(Date.now() - 20_000), new Date(Date.now() - 20_000));
+
+    processAllPendingMessages(
+      { agentName: "Self", registered: true } as MessengerState,
+      dirs,
+      () => { throw new Error("must not deliver while the live owner holds the lock"); },
+    );
+
+    expect(fs.readFileSync(path.join(lockPath, "owner"), "utf-8")).toBe(`${process.pid}:published-owner`);
+    expect(fs.existsSync(lockPath)).toBe(true);
+  });
+
+  it("returns immediately on a lock miss and retries without blocking", () => {
+    vi.useFakeTimers();
+    const root = createTempRoot();
+    const dirs = createDirs(root);
+    const inbox = path.join(dirs.inbox, "Self");
+    const ledger = path.join(dirs.base, "processed", "Self");
+    const lockPath = path.join(ledger, ".lock");
+    fs.mkdirSync(inbox, { recursive: true });
+    fs.mkdirSync(lockPath, { recursive: true });
+    fs.writeFileSync(path.join(lockPath, "owner"), `${process.pid}:other-token`);
+    fs.writeFileSync(path.join(inbox, "timer.json"), JSON.stringify({
+      id: "timer-id",
+      from: "Peer",
+      to: "Self",
+      text: "retry later",
+    }));
+
+    const delivered: string[] = [];
+    const state = { agentName: "Self", registered: true } as MessengerState;
+    processAllPendingMessages(state, dirs, msg => delivered.push(msg.id));
+    expect(delivered).toEqual([]);
+    expect(fs.existsSync(lockPath)).toBe(true);
+
+    vi.advanceTimersByTime(9_999);
+    expect(delivered).toEqual([]);
+    fs.rmSync(lockPath, { recursive: true, force: true });
+    vi.advanceTimersByTime(1);
+
+    expect(delivered).toEqual(["timer-id"]);
+  });
+
   it("normalizes message and ts fields before delivery", () => {
     const root = createTempRoot();
     const dirs = createDirs(root);
@@ -256,27 +448,82 @@ describe("store.processAllPendingMessages", () => {
     }));
     const state = { agentName: "Self", registered: true } as MessengerState;
     let deliveries = 0;
-    const originalUnlinkSync = fs.unlinkSync;
-    let failSourceUnlink = true;
-    const unlinkSpy = vi.spyOn(fs, "unlinkSync").mockImplementation((filePath) => {
-      if (String(filePath) === messagePath && failSourceUnlink) {
-        failSourceUnlink = false;
-        throw new Error("simulated unlink failure");
-      }
-      return originalUnlinkSync(filePath);
+    const movedSourcePath = `${messagePath}.leftover`;
+    processAllPendingMessages(state, dirs, () => {
+      deliveries++;
+      // Replace the source path after delivery. The real unlink then fails on a
+      // directory, without redefining the ESM fs namespace.
+      fs.renameSync(messagePath, movedSourcePath);
+      fs.mkdirSync(messagePath);
+    });
+    expect(deliveries).toBe(1);
+    expect(fs.statSync(messagePath).isDirectory()).toBe(true);
+
+    // Restore the source before the next pass. The marker was already durable,
+    // so recovery removes it without redelivering.
+    fs.rmSync(messagePath, { recursive: true });
+    fs.renameSync(movedSourcePath, messagePath);
+    processAllPendingMessages(state, dirs, () => { deliveries++; });
+    expect(deliveries).toBe(1);
+    expect(fs.existsSync(messagePath)).toBe(false);
+  });
+
+  it("keeps a non-string timestamp out of the durable fingerprint", () => {
+    const root = createTempRoot();
+    const dirs = createDirs(root);
+    const inbox = path.join(dirs.inbox, "Self");
+    fs.mkdirSync(inbox, { recursive: true });
+    const messagePath = path.join(inbox, "non-string-timestamp.json");
+    fs.writeFileSync(messagePath, JSON.stringify({
+      id: "non-string-timestamp-id",
+      from: "Peer",
+      to: "Self",
+      text: "Stable payload",
+      timestamp: 12345,
+    }));
+    const state = { agentName: "Self", registered: true } as MessengerState;
+    let deliveries = 0;
+    const leftoverPath = `${messagePath}.leftover`;
+
+    processAllPendingMessages(state, dirs, () => {
+      deliveries++;
+      fs.renameSync(messagePath, leftoverPath);
+      fs.mkdirSync(messagePath);
+    });
+    fs.rmSync(messagePath, { recursive: true });
+    fs.renameSync(leftoverPath, messagePath);
+    processAllPendingMessages({ agentName: "Self", registered: true } as MessengerState, dirs, () => {
+      deliveries++;
     });
 
-    try {
-      processAllPendingMessages(state, dirs, () => { deliveries++; });
-      expect(deliveries).toBe(1);
-      expect(fs.existsSync(messagePath)).toBe(true);
+    expect(deliveries).toBe(1);
+    expect(fs.existsSync(messagePath)).toBe(false);
+  });
 
-      processAllPendingMessages(state, dirs, () => { deliveries++; });
-      expect(deliveries).toBe(1);
-      expect(fs.existsSync(messagePath)).toBe(false);
-    } finally {
-      unlinkSpy.mockRestore();
-    }
+  it("durably pauses a message when both quarantine paths fail", () => {
+    const root = createTempRoot();
+    const dirs = createDirs(root);
+    const inbox = path.join(dirs.inbox, "Self");
+    fs.mkdirSync(inbox, { recursive: true });
+    const messagePath = path.join(inbox, "pause.json");
+    fs.writeFileSync(messagePath, JSON.stringify({ from: "Peer", to: "Self", text: "Pause me" }));
+    fs.mkdirSync(`${messagePath}.retry`);
+    processAllPendingMessages({ agentName: "Self", registered: true } as MessengerState, dirs, () => {
+      fs.unlinkSync(messagePath);
+      throw new Error("permanent failure");
+    });
+
+    const pausedDir = path.join(dirs.base, "paused", "Self");
+    expect(fs.readdirSync(pausedDir)).toHaveLength(1);
+    const pauseRecord = JSON.parse(fs.readFileSync(path.join(pausedDir, fs.readdirSync(pausedDir)[0]), "utf-8"));
+    expect(pauseRecord).toMatchObject({ messageId: "pause", messagePath });
+    fs.writeFileSync(messagePath, JSON.stringify({ from: "Peer", to: "Self", text: "Pause me" }));
+    let deliveries = 0;
+    processAllPendingMessages({ agentName: "Self", registered: true } as MessengerState, dirs, () => {
+      deliveries++;
+    });
+    expect(deliveries).toBe(0);
+    expect(fs.existsSync(messagePath)).toBe(true);
   });
 
   it("retains the source when processed marker persistence fails", () => {
@@ -293,22 +540,62 @@ describe("store.processAllPendingMessages", () => {
     }));
     const state = { agentName: "Self", registered: true } as MessengerState;
     let deliveries = 0;
-    const originalMkdirSync = fs.mkdirSync;
-    const mkdirSpy = vi.spyOn(fs, "mkdirSync").mockImplementation((dirPath, options) => {
-      if (String(dirPath).endsWith(path.join("processed", "Self"))) {
-        throw new Error("simulated marker persistence failure");
-      }
-      return originalMkdirSync(dirPath, options);
-    });
+    const ledger = path.join(dirs.base, "processed", "Self");
+    const markerName = `${createHash("sha256").update("marker-failure-id", "utf8").digest("hex")}.json`;
 
-    try {
-      processAllPendingMessages(state, dirs, () => { deliveries++; });
-      expect(deliveries).toBe(1);
-      expect(fs.existsSync(messagePath)).toBe(true);
-      expect(fs.existsSync(path.join(dirs.base, "processed", "Self"))).toBe(false);
-    } finally {
-      mkdirSpy.mockRestore();
-    }
+    processAllPendingMessages(state, dirs, () => {
+      deliveries++;
+      fs.mkdirSync(ledger, { recursive: true });
+      // Create the destination after the marker check, so atomic rename fails
+      // only when acknowledgement is persisted.
+      fs.mkdirSync(path.join(ledger, markerName));
+    });
+    expect(deliveries).toBe(1);
+    expect(fs.existsSync(messagePath)).toBe(true);
+  });
+
+  it("quarantines a same-id message whose payload fingerprint conflicts", () => {
+    const root = createTempRoot();
+    const dirs = createDirs(root);
+    const inbox = path.join(dirs.inbox, "Self");
+    fs.mkdirSync(inbox, { recursive: true });
+    const message = { id: "conflicting-id", from: "Peer", to: "Self", text: "first" };
+    fs.writeFileSync(path.join(inbox, "first.json"), JSON.stringify(message));
+    fs.writeFileSync(path.join(inbox, "second.json"), JSON.stringify({ ...message, text: "different" }));
+    const state = { agentName: "Self", registered: true } as MessengerState;
+    const delivered: string[] = [];
+
+    processAllPendingMessages(state, dirs, msg => delivered.push(msg.text));
+
+    expect(delivered).toEqual(["first"]);
+    const quarantine = path.join(inbox, "quarantine");
+    const reasonFiles = fs.readdirSync(quarantine).filter(file => file.endsWith(".reason"));
+    expect(reasonFiles).toHaveLength(1);
+    expect(JSON.parse(fs.readFileSync(path.join(quarantine, reasonFiles[0]), "utf-8")).reason)
+      .toContain("processed message ID conflict");
+  });
+
+  it("fails closed for a legacy marker without a payload fingerprint", () => {
+    const root = createTempRoot();
+    const dirs = createDirs(root);
+    const inbox = path.join(dirs.inbox, "Self");
+    const ledger = path.join(dirs.base, "processed", "Self");
+    fs.mkdirSync(inbox, { recursive: true });
+    fs.mkdirSync(ledger, { recursive: true });
+    const message = { id: "legacy-id", from: "Peer", to: "Self", text: "legacy" };
+    fs.writeFileSync(path.join(inbox, "legacy.json"), JSON.stringify(message));
+    const markerName = `${createHash("sha256").update("legacy-id", "utf8").digest("hex")}.json`;
+    fs.writeFileSync(path.join(ledger, markerName), JSON.stringify({ id: "legacy-id", processedAt: new Date().toISOString() }));
+    const delivered: string[] = [];
+
+    processAllPendingMessages({ agentName: "Self", registered: true } as MessengerState, dirs, msg => delivered.push(msg.id));
+
+    expect(delivered).toEqual([]);
+    expect(fs.existsSync(path.join(inbox, "legacy.json"))).toBe(false);
+    const quarantine = path.join(inbox, "quarantine");
+    const reasonFiles = fs.readdirSync(quarantine).filter(file => file.endsWith(".reason"));
+    expect(JSON.parse(fs.readFileSync(path.join(quarantine, reasonFiles[0]), "utf-8")).reason)
+      .toContain("legacy marker");
   });
 
   it("retains a failed delivery for retry and removes it after recovery", () => {
@@ -366,7 +653,7 @@ describe("store.processAllPendingMessages", () => {
     });
   });
 
-  it("bounds retries in memory when the retry sidecar cannot be written", () => {
+  it("durably quarantines when the retry sidecar cannot be written", () => {
     const root = createTempRoot();
     const dirs = createDirs(root);
     const inbox = path.join(dirs.inbox, "Self");
@@ -375,9 +662,7 @@ describe("store.processAllPendingMessages", () => {
     fs.mkdirSync(path.join(inbox, "sidecar.json.retry"));
     const state = { agentName: "Self", registered: true } as MessengerState;
 
-    for (let attempt = 0; attempt < 3; attempt++) {
-      processAllPendingMessages(state, dirs, () => { throw new Error("sidecar unavailable"); });
-    }
+    processAllPendingMessages(state, dirs, () => { throw new Error("sidecar unavailable"); });
 
     expect(fs.existsSync(path.join(inbox, "sidecar.json"))).toBe(false);
     expect(fs.readdirSync(path.join(inbox, "quarantine"))).toHaveLength(2);
