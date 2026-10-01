@@ -13,6 +13,7 @@ import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { randomUUID } from "node:crypto";
 import { generateMemorableName } from "../lib.ts";
+import { writeInboxMessageAtomically } from "../store.ts";
 import { resolveThinking, modelHasThinkingSuffix, pushModelArgs, getPiCommand, resolveModel } from "./agents.ts";
 import { discoverCrewAgents } from "./utils/discover.ts";
 import { loadCrewConfig, type CrewConfig } from "./utils/config.ts";
@@ -253,7 +254,7 @@ ${taskPrompt}`,
     try { fs.unlinkSync(aliveFile); } catch {}
   }
   try {
-    fs.writeFileSync(msgFile, JSON.stringify(msg, null, 2));
+    writeInboxMessageAtomically(msgFile, msg);
   } catch {
     if (aliveFile) {
       try { fs.writeFileSync(aliveFile, "", { mode: 0o600 }); } catch {}

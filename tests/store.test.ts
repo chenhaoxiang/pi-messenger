@@ -3,7 +3,13 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import type { AgentRegistration, Dirs, MessengerState } from "../lib.ts";
-import { getActiveAgents, invalidateAgentsCache, processAllPendingMessages, register } from "../store.ts";
+import {
+  getActiveAgents,
+  invalidateAgentsCache,
+  processAllPendingMessages,
+  register,
+  sendMessageToAgent,
+} from "../store.ts";
 
 const roots = new Set<string>();
 const initialCwd = process.cwd();
@@ -182,5 +188,106 @@ describe("store.processAllPendingMessages", () => {
       },
     ]);
     expect(fs.readdirSync(inbox)).toEqual([]);
+  });
+
+  it("writes inbox messages atomically and binds them to the current target session", () => {
+    const root = createTempRoot();
+    const dirs = createDirs(root);
+    writeRegistration(dirs.registry, "Peer", process.cwd());
+
+    const msg = sendMessageToAgent(
+      { agentName: "Self" } as MessengerState,
+      dirs,
+      "Peer",
+      "Atomic body",
+    );
+    const inbox = path.join(dirs.inbox, "Peer");
+    const files = fs.readdirSync(inbox);
+
+    expect(files).toHaveLength(1);
+    expect(files[0]).toMatch(/\.json$/);
+    expect(JSON.parse(fs.readFileSync(path.join(inbox, files[0]), "utf-8"))).toMatchObject({
+      id: msg.id,
+      text: "Atomic body",
+      targetSessionId: "session-1",
+    });
+  });
+
+  it("retains a failed delivery for retry and removes it after recovery", () => {
+    const root = createTempRoot();
+    const dirs = createDirs(root);
+    const inbox = path.join(dirs.inbox, "Self");
+    fs.mkdirSync(inbox, { recursive: true });
+    fs.writeFileSync(path.join(inbox, "retry.json"), JSON.stringify({
+      from: "Peer",
+      to: "Self",
+      text: "Retry me",
+      timestamp: new Date().toISOString(),
+    }));
+    const state = { agentName: "Self", registered: true } as MessengerState;
+    let shouldFail = true;
+
+    processAllPendingMessages(state, dirs, () => {
+      if (shouldFail) throw new Error("temporary failure");
+    });
+    expect(fs.existsSync(path.join(inbox, "retry.json"))).toBe(true);
+    expect(fs.readFileSync(path.join(inbox, "retry.json.retry"), "utf-8")).toBe("1");
+
+    shouldFail = false;
+    processAllPendingMessages(state, dirs, () => undefined);
+    expect(fs.existsSync(path.join(inbox, "retry.json"))).toBe(false);
+    expect(fs.existsSync(path.join(inbox, "retry.json.retry"))).toBe(false);
+  });
+
+  it("quarantines permanently failing messages with durable evidence", () => {
+    const root = createTempRoot();
+    const dirs = createDirs(root);
+    const inbox = path.join(dirs.inbox, "Self");
+    fs.mkdirSync(inbox, { recursive: true });
+    fs.writeFileSync(path.join(inbox, "bad.json"), JSON.stringify({
+      from: "Peer",
+      to: "Self",
+      text: "Never deliver",
+    }));
+    const state = { agentName: "Self", registered: true } as MessengerState;
+
+    for (let attempt = 0; attempt < 3; attempt++) {
+      processAllPendingMessages(state, dirs, () => {
+        throw new Error("permanent failure");
+      });
+    }
+
+    expect(fs.existsSync(path.join(inbox, "bad.json"))).toBe(false);
+    const quarantine = path.join(inbox, "quarantine");
+    const quarantined = fs.readdirSync(quarantine);
+    expect(quarantined.some(file => file.endsWith("-bad.json"))).toBe(true);
+    const reasonFile = quarantined.find(file => file.endsWith("-bad.json.reason"));
+    expect(reasonFile).toBeDefined();
+    expect(JSON.parse(fs.readFileSync(path.join(quarantine, reasonFile!), "utf-8"))).toMatchObject({
+      reason: "permanent failure",
+    });
+  });
+
+  it("quarantines session-bound mail when the agent name is reused", () => {
+    const root = createTempRoot();
+    const dirs = createDirs(root);
+    const inbox = path.join(dirs.inbox, "Self");
+    fs.mkdirSync(inbox, { recursive: true });
+    writeRegistration(dirs.registry, "Self", process.cwd());
+    fs.writeFileSync(path.join(inbox, "stale.json"), JSON.stringify({
+      from: "Peer",
+      to: "Self",
+      text: "Stale message",
+      targetSessionId: "old-session",
+    }));
+
+    processAllPendingMessages(
+      { agentName: "Self", registered: true } as MessengerState,
+      dirs,
+      () => { throw new Error("must not deliver stale mail"); },
+    );
+
+    expect(fs.existsSync(path.join(inbox, "stale.json"))).toBe(false);
+    expect(fs.readdirSync(path.join(inbox, "quarantine"))).toHaveLength(2);
   });
 });

@@ -4,7 +4,7 @@
 
 import * as fs from "node:fs";
 import { randomUUID } from "node:crypto";
-import { join, resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import { execSync } from "node:child_process";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import {
@@ -100,6 +100,27 @@ function getGitBranch(cwd: string): string | undefined {
 }
 
 const LOCK_STALE_MS = 10000;
+const MESSAGE_RETRY_LIMIT = 3;
+
+function writeJsonAtomically(filePath: string, data: unknown): void {
+  const tempPath = `${filePath}.tmp-${process.pid}-${randomUUID()}`;
+  try {
+    fs.writeFileSync(tempPath, JSON.stringify(data, null, 2));
+    fs.renameSync(tempPath, filePath);
+  } catch (error) {
+    try {
+      fs.unlinkSync(tempPath);
+    } catch {
+      // Best effort cleanup.
+    }
+    throw error;
+  }
+}
+
+/** Write an inbox message without exposing a partially-written final JSON file. */
+export function writeInboxMessageAtomically(filePath: string, message: unknown): void {
+  writeJsonAtomically(filePath, message);
+}
 
 async function withSwarmLock<T>(baseDir: string, fn: () => T): Promise<T> {
   const lockPath = join(baseDir, "swarm.lock");
@@ -948,6 +969,70 @@ export function getMyInbox(state: MessengerState, dirs: Dirs): string {
   return join(dirs.inbox, state.agentName);
 }
 
+function retryMetadataPath(msgPath: string): string {
+  return `${msgPath}.retry`;
+}
+
+function recordMessageFailure(msgPath: string): number {
+  const retryPath = retryMetadataPath(msgPath);
+  let attempts = 0;
+  try {
+    attempts = Number.parseInt(fs.readFileSync(retryPath, "utf-8"), 10) || 0;
+  } catch {
+    // First failure, or metadata was not readable.
+  }
+  attempts++;
+  try {
+    fs.writeFileSync(retryPath, String(attempts), { mode: 0o600 });
+  } catch {
+    // The message itself remains durable even if retry metadata cannot be written.
+  }
+  return attempts;
+}
+
+function clearMessageFailure(msgPath: string): void {
+  try {
+    fs.unlinkSync(retryMetadataPath(msgPath));
+  } catch {
+    // No retry metadata is normal.
+  }
+}
+
+function quarantineMessage(msgPath: string, reason: string): void {
+  const quarantineDir = join(dirname(msgPath), "quarantine");
+  ensureDirSync(quarantineDir);
+  const destination = join(quarantineDir, `${Date.now()}-${randomUUID()}-${basename(msgPath)}`);
+  try {
+    fs.renameSync(msgPath, destination);
+    clearMessageFailure(msgPath);
+    try {
+      writeJsonAtomically(`${destination}.reason`, {
+        reason,
+        quarantinedAt: new Date().toISOString(),
+      });
+    } catch {
+      // The quarantined message remains durable even if its evidence sidecar cannot be written.
+    }
+  } catch {
+    // If quarantine fails, leave the original message for a later processing attempt.
+  }
+}
+
+type TargetSessionCheck = "not-bound" | "match" | "mismatch" | "unavailable";
+
+function checkTargetSession(msg: AgentMailMessage, dirs: Dirs): TargetSessionCheck {
+  if (!msg.targetSessionId) return "not-bound";
+
+  const registrationPath = join(dirs.registry, `${msg.to}.json`);
+  if (!fs.existsSync(registrationPath)) return "mismatch";
+  try {
+    const registration = JSON.parse(fs.readFileSync(registrationPath, "utf-8")) as Partial<AgentRegistration>;
+    return registration.sessionId === msg.targetSessionId ? "match" : "mismatch";
+  } catch {
+    return "unavailable";
+  }
+}
+
 export function processAllPendingMessages(
   state: MessengerState,
   dirs: Dirs,
@@ -984,15 +1069,26 @@ export function processAllPendingMessages(
           to: state.agentName,
           timestamp: new Date().toISOString(),
         });
+        const targetSession = checkTargetSession(msg, dirs);
+        if (targetSession === "mismatch") {
+          quarantineMessage(msgPath, "target session is no longer active for this agent name");
+          continue;
+        }
+        if (targetSession === "unavailable") {
+          throw new Error("target registration is temporarily unreadable");
+        }
         deliverFn(msg);
         fs.unlinkSync(msgPath);
-      } catch {
-        // On any failure (read, parse, deliver), delete to avoid infinite retry loops
-        try {
-          fs.unlinkSync(msgPath);
-        } catch {
-          // Already gone or can't delete
+        clearMessageFailure(msgPath);
+      } catch (error) {
+        const attempts = recordMessageFailure(msgPath);
+        if (attempts >= MESSAGE_RETRY_LIMIT) {
+          quarantineMessage(
+            msgPath,
+            error instanceof Error ? error.message : "message read or delivery failed",
+          );
         }
+        // Retain failures below the limit so a transient read/delivery error can recover.
       }
     }
   } finally {
@@ -1017,18 +1113,31 @@ export function sendMessageToAgent(
   const targetInbox = join(dirs.inbox, to);
   ensureDirSync(targetInbox);
 
+  let targetSessionId: string | undefined;
+  try {
+    const targetRegistration = JSON.parse(
+      fs.readFileSync(join(dirs.registry, `${to}.json`), "utf-8"),
+    ) as Partial<AgentRegistration>;
+    if (typeof targetRegistration.sessionId === "string") {
+      targetSessionId = targetRegistration.sessionId;
+    }
+  } catch {
+    // Keep compatibility with callers that queue mail before registration exists.
+  }
+
   const msg: AgentMailMessage = {
     id: randomUUID(),
     from: state.agentName,
     to,
     text,
     timestamp: new Date().toISOString(),
-    replyTo: replyTo ?? null
+    replyTo: replyTo ?? null,
+    ...(targetSessionId ? { targetSessionId } : {}),
   };
 
   const random = Math.random().toString(36).substring(2, 8);
   const msgFile = join(targetInbox, `${Date.now()}-${random}.json`);
-  fs.writeFileSync(msgFile, JSON.stringify(msg, null, 2));
+  writeInboxMessageAtomically(msgFile, msg);
 
   return msg;
 }
