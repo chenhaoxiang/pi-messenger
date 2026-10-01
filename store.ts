@@ -2,7 +2,7 @@
  * Pi Messenger - File Storage Operations
  */
 
-import * as fs from "node:fs";
+import fs from "node:fs";
 import { createHash, randomUUID } from "node:crypto";
 import { basename, dirname, join, resolve } from "node:path";
 import { execSync } from "node:child_process";
