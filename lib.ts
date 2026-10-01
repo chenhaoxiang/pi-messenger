@@ -50,6 +50,8 @@ export interface AgentMailMessage {
   text: string;
   timestamp: string;
   replyTo: string | null;
+  /** Session registered for the target name when this message was queued. */
+  targetSessionId?: string;
 }
 
 interface AgentMailMessageInput {
@@ -61,6 +63,7 @@ interface AgentMailMessageInput {
   timestamp?: unknown;
   ts?: unknown;
   replyTo?: unknown;
+  targetSessionId?: unknown;
 }
 
 function stringField(value: unknown, fallback: string): string {
@@ -82,6 +85,7 @@ export function normalizeAgentMailMessage(
     text: stringField(raw.text, stringField(raw.message, "")),
     timestamp: stringField(raw.timestamp, stringField(raw.ts, defaults.timestamp)),
     replyTo: typeof raw.replyTo === "string" ? raw.replyTo : null,
+    ...(typeof raw.targetSessionId === "string" ? { targetSessionId: raw.targetSessionId } : {}),
   };
 }
 

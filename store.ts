@@ -2,9 +2,9 @@
  * Pi Messenger - File Storage Operations
  */
 
-import * as fs from "node:fs";
-import { randomUUID } from "node:crypto";
-import { join, resolve } from "node:path";
+import fs from "node:fs";
+import { createHash, randomUUID } from "node:crypto";
+import { basename, dirname, join, resolve } from "node:path";
 import { execSync } from "node:child_process";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import {
@@ -100,6 +100,46 @@ function getGitBranch(cwd: string): string | undefined {
 }
 
 const LOCK_STALE_MS = 10000;
+const MESSAGE_RETRY_LIMIT = 3;
+// Processed markers are kept outside inbox directories, retained for 30 days, and capped at 1024 per inbox.
+const PROCESSED_MARKER_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
+const MAX_PROCESSED_MARKERS = 1024;
+const MAX_IN_MEMORY_RETRY_TRACKS = 1024;
+const inMemoryMessageRetries = new Map<string, number>();
+const blockedInboxMessages = new WeakMap<MessengerState, string>();
+
+function writeJsonAtomically(filePath: string, data: unknown): void {
+  const tempPath = `${filePath}.tmp-${process.pid}-${randomUUID()}`;
+  try {
+    fs.writeFileSync(tempPath, JSON.stringify(data, null, 2));
+    fs.renameSync(tempPath, filePath);
+  } catch (error) {
+    try {
+      fs.unlinkSync(tempPath);
+    } catch {
+      // Best effort cleanup.
+    }
+    throw error;
+  }
+}
+
+/** Write an inbox message without exposing a partially-written final JSON file. */
+export function writeInboxMessageAtomically(filePath: string, message: unknown): void {
+  writeJsonAtomically(filePath, message);
+}
+
+/** Write only when the target has a readable, non-empty current session identity. */
+export function writeTargetInboxMessageAtomically(
+  filePath: string,
+  message: Record<string, unknown>,
+  to: string,
+  dirs: Pick<Dirs, "registry">,
+): boolean {
+  const target = lookupTargetSession(to, dirs.registry);
+  if (target.status !== "available") return false;
+  writeJsonAtomically(filePath, { ...message, targetSessionId: target.sessionId });
+  return true;
+}
 
 async function withSwarmLock<T>(baseDir: string, fn: () => T): Promise<T> {
   const lockPath = join(baseDir, "swarm.lock");
@@ -330,14 +370,6 @@ export function register(state: MessengerState, dirs: Dirs, ctx: ExtensionContex
     }
 
     const regPath = getRegistrationPath(state, dirs);
-    if (fs.existsSync(regPath)) {
-      try {
-        fs.unlinkSync(regPath);
-      } catch {
-        // Ignore
-      }
-    }
-
     ensureDirSync(getMyInbox(state, dirs));
 
     const cwd = normalizeCwd(ctx.cwd);
@@ -358,7 +390,7 @@ export function register(state: MessengerState, dirs: Dirs, ctx: ExtensionContex
     };
 
     try {
-      fs.writeFileSync(regPath, JSON.stringify(registration, null, 2));
+      writeJsonAtomically(regPath, registration);
     } catch (err) {
       if (ctx.hasUI) {
         const msg = err instanceof Error ? err.message : "unknown error";
@@ -438,7 +470,7 @@ export function updateRegistration(state: MessengerState, dirs: Dirs, ctx: Exten
     reg.session = { ...state.session };
     reg.activity = { ...state.activity };
     reg.statusMessage = state.statusMessage;
-    fs.writeFileSync(regPath, JSON.stringify(reg, null, 2));
+    writeJsonAtomically(regPath, reg);
   } catch {
     // Ignore errors
   }
@@ -459,7 +491,7 @@ export function flushActivityToRegistry(state: MessengerState, dirs: Dirs, ctx: 
     reg.session = { ...state.session };
     reg.activity = { ...state.activity };
     reg.statusMessage = state.statusMessage;
-    fs.writeFileSync(regPath, JSON.stringify(reg, null, 2));
+    writeJsonAtomically(regPath, reg);
   } catch {
     // Ignore errors
   }
@@ -545,7 +577,7 @@ export function renameAgent(
   ensureDirSync(dirs.registry);
   
   try {
-    fs.writeFileSync(join(dirs.registry, `${newName}.json`), JSON.stringify(registration, null, 2));
+    writeJsonAtomically(join(dirs.registry, `${newName}.json`), registration);
   } catch (err) {
     return { success: false, error: "invalid_name" as const };
   }
@@ -948,6 +980,180 @@ export function getMyInbox(state: MessengerState, dirs: Dirs): string {
   return join(dirs.inbox, state.agentName);
 }
 
+function retryMetadataPath(msgPath: string): string {
+  return `${msgPath}.retry`;
+}
+
+function processedLedgerPath(inbox: string): string {
+  // Keep the ledger beside the shared inbox directory, not inside an inbox scan root.
+  return join(dirname(dirname(inbox)), "processed", basename(inbox));
+}
+
+function processedMarkerPath(ledgerPath: string, messageId: string): string {
+  const key = createHash("sha256").update(messageId, "utf8").digest("hex");
+  return join(ledgerPath, `${key}.json`);
+}
+
+function hasProcessedMarker(ledgerPath: string, messageId: string): boolean {
+  const markerPath = processedMarkerPath(ledgerPath, messageId);
+  try {
+    const marker = JSON.parse(fs.readFileSync(markerPath, "utf-8")) as { id?: unknown };
+    if (marker.id !== messageId) {
+      throw new Error(`processed marker identity mismatch for ${messageId}`);
+    }
+    return true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+    throw error;
+  }
+}
+
+function pruneProcessedMarkers(ledgerPath: string): void {
+  try {
+    const now = Date.now();
+    const entries = fs.readdirSync(ledgerPath)
+      .filter(file => file.endsWith(".json"))
+      .map(file => {
+        const markerPath = join(ledgerPath, file);
+        return { markerPath, mtimeMs: fs.statSync(markerPath).mtimeMs };
+      });
+
+    for (const entry of entries) {
+      if (now - entry.mtimeMs > PROCESSED_MARKER_RETENTION_MS) {
+        try {
+          fs.unlinkSync(entry.markerPath);
+        } catch {
+          // Best effort retention cleanup.
+        }
+      }
+    }
+
+    const remaining = entries
+      .filter(entry => fs.existsSync(entry.markerPath))
+      .sort((a, b) => a.mtimeMs - b.mtimeMs);
+    while (remaining.length > MAX_PROCESSED_MARKERS) {
+      const oldest = remaining.shift();
+      if (!oldest) break;
+      try {
+        fs.unlinkSync(oldest.markerPath);
+      } catch {
+        // Best effort retention cleanup.
+      }
+    }
+  } catch {
+    // Marker persistence has already succeeded; cleanup must not make delivery less durable.
+  }
+}
+
+function persistProcessedMarker(ledgerPath: string, messageId: string): void {
+  ensureDirSync(ledgerPath);
+  writeJsonAtomically(processedMarkerPath(ledgerPath, messageId), {
+    id: messageId,
+    processedAt: new Date().toISOString(),
+  });
+  pruneProcessedMarkers(ledgerPath);
+}
+
+function recordMessageFailure(msgPath: string): number {
+  const retryPath = retryMetadataPath(msgPath);
+  let persistedAttempts = 0;
+  try {
+    persistedAttempts = Number.parseInt(fs.readFileSync(retryPath, "utf-8"), 10) || 0;
+  } catch {
+    // First failure, or metadata was not readable.
+  }
+
+  const previousAttempts = inMemoryMessageRetries.get(msgPath) ?? 0;
+  const attempts = Math.max(persistedAttempts, previousAttempts) + 1;
+  try {
+    fs.writeFileSync(retryPath, String(attempts), { mode: 0o600 });
+    inMemoryMessageRetries.delete(msgPath);
+  } catch {
+    // Keep a bounded in-process count when the sidecar cannot be persisted.
+    if (!inMemoryMessageRetries.has(msgPath) && inMemoryMessageRetries.size >= MAX_IN_MEMORY_RETRY_TRACKS) {
+      return MESSAGE_RETRY_LIMIT;
+    }
+    inMemoryMessageRetries.set(msgPath, attempts);
+  }
+  return attempts;
+}
+
+function clearMessageFailure(msgPath: string): void {
+  inMemoryMessageRetries.delete(msgPath);
+  try {
+    fs.unlinkSync(retryMetadataPath(msgPath));
+  } catch {
+    // No retry metadata is normal.
+  }
+}
+
+function quarantineMessage(msgPath: string, reason: string): boolean {
+  const quarantineName = `${Date.now()}-${randomUUID()}-${basename(msgPath)}`;
+  try {
+    const quarantineDir = join(dirname(msgPath), "quarantine");
+    ensureDirSync(quarantineDir);
+    const destination = join(quarantineDir, quarantineName);
+    fs.renameSync(msgPath, destination);
+    clearMessageFailure(msgPath);
+    try {
+      writeJsonAtomically(`${destination}.reason`, {
+        reason,
+        quarantinedAt: new Date().toISOString(),
+      });
+    } catch {
+      // The quarantined message remains durable even if its evidence sidecar cannot be written.
+    }
+    return true;
+  } catch {
+    // Fall back to a sibling dead-letter file whose suffix cannot be scanned as inbox JSON.
+    const fallbackPath = `${msgPath}.quarantined-${quarantineName}.dead-letter`;
+    try {
+      fs.renameSync(msgPath, fallbackPath);
+      clearMessageFailure(msgPath);
+      try {
+        writeJsonAtomically(`${fallbackPath}.reason`, {
+          reason,
+          quarantinedAt: new Date().toISOString(),
+        });
+      } catch {
+        // The fallback message remains durable even if its evidence sidecar cannot be written.
+      }
+      return true;
+    } catch {
+      // Leave the original message in place if no durable quarantine is possible.
+      return false;
+    }
+  }
+}
+
+export type TargetSessionLookup =
+  | { status: "available"; sessionId: string }
+  | { status: "missing" | "invalid" | "unreadable" };
+
+/** Read the target registration once for all inbox producers and consumers. */
+export function lookupTargetSession(to: string, registryDir: string): TargetSessionLookup {
+  const registrationPath = join(registryDir, `${to}.json`);
+  if (!fs.existsSync(registrationPath)) return { status: "missing" };
+  try {
+    const registration = JSON.parse(fs.readFileSync(registrationPath, "utf-8")) as Partial<AgentRegistration>;
+    if (typeof registration.sessionId !== "string" || registration.sessionId.length === 0) {
+      return { status: "invalid" };
+    }
+    return { status: "available", sessionId: registration.sessionId };
+  } catch {
+    return { status: "unreadable" };
+  }
+}
+
+function checkTargetSession(msg: AgentMailMessage, dirs: Dirs): "not-bound" | "match" | "mismatch" | "unavailable" {
+  if (!msg.targetSessionId) return "not-bound";
+  const target = lookupTargetSession(msg.to, dirs.registry);
+  if (target.status === "available") {
+    return target.sessionId === msg.targetSessionId ? "match" : "mismatch";
+  }
+  return target.status === "missing" ? "mismatch" : "unavailable";
+}
+
 export function processAllPendingMessages(
   state: MessengerState,
   dirs: Dirs,
@@ -966,6 +1172,15 @@ export function processAllPendingMessages(
   try {
     const inbox = getMyInbox(state, dirs);
     if (!fs.existsSync(inbox)) return;
+    const processedLedger = processedLedgerPath(inbox);
+    pruneProcessedMarkers(processedLedger);
+
+    const blockedPath = blockedInboxMessages.get(state);
+    if (blockedPath) {
+      if (fs.existsSync(blockedPath)) return;
+      clearMessageFailure(blockedPath);
+      blockedInboxMessages.delete(state);
+    }
 
     let files: string[];
     try {
@@ -984,15 +1199,38 @@ export function processAllPendingMessages(
           to: state.agentName,
           timestamp: new Date().toISOString(),
         });
-        deliverFn(msg);
-        fs.unlinkSync(msgPath);
-      } catch {
-        // On any failure (read, parse, deliver), delete to avoid infinite retry loops
-        try {
+        if (hasProcessedMarker(processedLedger, msg.id)) {
           fs.unlinkSync(msgPath);
-        } catch {
-          // Already gone or can't delete
+          clearMessageFailure(msgPath);
+          continue;
         }
+        const targetSession = checkTargetSession(msg, dirs);
+        if (targetSession === "mismatch") {
+          if (!quarantineMessage(msgPath, "target session is no longer active for this agent name")) {
+            throw new Error("target session mismatch could not be quarantined");
+          }
+          continue;
+        }
+        if (targetSession === "unavailable") {
+          throw new Error("target registration is temporarily unreadable");
+        }
+        deliverFn(msg);
+        // Persist the durable acknowledgement before unlinking the source message. If this fails,
+        // the source remains retryable and no delivery is silently claimed as complete.
+        persistProcessedMarker(processedLedger, msg.id);
+        fs.unlinkSync(msgPath);
+        clearMessageFailure(msgPath);
+      } catch (error) {
+        const attempts = recordMessageFailure(msgPath);
+        if (attempts >= MESSAGE_RETRY_LIMIT) {
+          const reason = error instanceof Error ? error.message : "message read or delivery failed";
+          if (!quarantineMessage(msgPath, reason)) {
+            blockedInboxMessages.set(state, msgPath);
+            console.error(`Pi Messenger inbox paused: could not quarantine ${msgPath}: ${reason}`);
+            return;
+          }
+        }
+        // Retain failures below the limit so a transient read/delivery error can recover.
       }
     }
   } finally {
@@ -1017,18 +1255,25 @@ export function sendMessageToAgent(
   const targetInbox = join(dirs.inbox, to);
   ensureDirSync(targetInbox);
 
+  const targetSession = lookupTargetSession(to, dirs.registry);
+  const targetSessionId = targetSession.status === "available"
+    ? targetSession.sessionId
+    : undefined;
+  // Keep compatibility with callers that queue mail before registration exists.
+
   const msg: AgentMailMessage = {
     id: randomUUID(),
     from: state.agentName,
     to,
     text,
     timestamp: new Date().toISOString(),
-    replyTo: replyTo ?? null
+    replyTo: replyTo ?? null,
+    ...(targetSessionId ? { targetSessionId } : {}),
   };
 
   const random = Math.random().toString(36).substring(2, 8);
   const msgFile = join(targetInbox, `${Date.now()}-${random}.json`);
-  fs.writeFileSync(msgFile, JSON.stringify(msg, null, 2));
+  writeInboxMessageAtomically(msgFile, msg);
 
   return msg;
 }

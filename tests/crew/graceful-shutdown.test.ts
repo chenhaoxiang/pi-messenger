@@ -93,6 +93,7 @@ describe("crew/graceful shutdown", () => {
     fs.writeFileSync(path.join(messengerDirs.registry, `${workerName}.json`), JSON.stringify({
       name: workerName,
       pid: 4242,
+      sessionId: "session-1",
     }, null, 2));
 
     const controller = new AbortController();
@@ -122,6 +123,7 @@ describe("crew/graceful shutdown", () => {
     );
     expect(shutdownPayload.text).toContain("SHUTDOWN REQUESTED");
     expect(shutdownPayload.from).toBe("crew-orchestrator");
+    expect(shutdownPayload.targetSessionId).toBe("session-1");
 
     expect(fs.existsSync(path.join(messengerDirs.registry, `${workerName}.json`))).toBe(false);
   });

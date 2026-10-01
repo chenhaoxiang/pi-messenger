@@ -59,7 +59,7 @@ export function spawnWorkersForReadyTasks(
       attempt_count: task.attempt_count + 1,
     });
 
-    if (!assignTaskToLobbyWorker(lw, task.id, prompt, inboxDir)) {
+    if (!assignTaskToLobbyWorker(lw, task.id, prompt, inboxDir, join(cwd, ".pi", "messenger", "registry"))) {
       store.updateTask(cwd, task.id, { status: "todo", assigned_to: undefined });
       continue;
     }

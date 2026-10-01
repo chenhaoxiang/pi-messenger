@@ -159,7 +159,7 @@ export async function execute(
       assigned_to: lobbyWorker.name,
       attempt_count: task.attempt_count + 1,
     });
-    if (!assignTaskToLobbyWorker(lobbyWorker, task.id, prompt, dirs.inbox)) {
+    if (!assignTaskToLobbyWorker(lobbyWorker, task.id, prompt, dirs.inbox, dirs.registry)) {
       store.updateTask(cwd, task.id, { status: "todo", assigned_to: undefined });
       continue;
     }

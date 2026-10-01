@@ -66,7 +66,7 @@ pi_messenger({ action: "review", target: "task-1" })    // Reviewer checks imple
 
 **Discovery** - Agents register with memorable themed names (SwiftRaven, LunarDust, OakTree). See who's active, what they're working on, which model and git branch they're on.
 
-**Messaging** - Send messages between agents. Recipients wake up immediately and see the message as a steering prompt.
+**Messaging** - Send messages between agents. Recipients wake up immediately and see the message as a steering prompt. Successful deliveries also leave a durable per-inbox processed marker under the messenger `processed/` directory, outside inbox scanning. Markers are retained for 30 days and capped at 1024 per inbox; cleanup is best effort, while marker writes are atomic and must succeed before the inbox file is removed.
 
 **File Reservations** - Claim files or directories. Other agents get blocked with a clear message telling them who to coordinate with. Auto-releases on `leave` or exit.
 
