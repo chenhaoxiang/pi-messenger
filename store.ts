@@ -1109,6 +1109,23 @@ function tryRecoverStaleInboxLock(lockPath: string): void {
       return;
     }
 
+    // The owner may have been published after the initial owner-less check,
+    // while the recovery marker kept other recoverers out. Re-read ownership
+    // immediately before claiming the directory; inode identity alone is not
+    // enough because the owner file can change in place.
+    try {
+      const owner = fs.readFileSync(join(lockPath, "owner"), "utf-8");
+      const ownerPid = Number.parseInt(owner.split(":", 1)[0], 10);
+      if (ownerPid && isProcessAlive(ownerPid)) {
+        if (fs.readFileSync(recoveryPath, "utf-8") === markerToken) fs.unlinkSync(recoveryPath);
+        return;
+      }
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+        // An unreadable owner is handled like the initial stale-owner check.
+      }
+    }
+
     const claimedPath = `${lockPath}.stale-${process.pid}-${randomUUID()}`;
     try {
       fs.renameSync(lockPath, claimedPath);
@@ -1142,24 +1159,36 @@ function acquireInboxLock(ledgerPath: string): InboxLock | null {
 
   const lockPath = join(ledgerPath, ".lock");
   const token = `${process.pid}:${randomUUID()}`;
+  // Initialize ownership away from the canonical name. This prevents stale
+  // recovery from mistaking an owner-less initialization directory for a live
+  // lock, and ensures failed cleanup can never remove another owner's lock.
+  const stagingPath = join(ledgerPath, `.lock-start-${process.pid}-${randomUUID()}`);
   try {
-    // mkdir is the ownership operation: it keeps .lock occupied throughout
-    // stale recovery and avoids a file replacement window.
-    fs.mkdirSync(lockPath, { mode: 0o700 });
-  } catch (error) {
-    const code = (error as NodeJS.ErrnoException).code;
-    if (code === "EEXIST") tryRecoverStaleInboxLock(lockPath);
-    return null;
-  }
-
-  try {
-    fs.writeFileSync(join(lockPath, "owner"), token, { mode: 0o600, flag: "wx" });
+    fs.mkdirSync(stagingPath, { mode: 0o700 });
+    fs.writeFileSync(join(stagingPath, "owner"), token, { mode: 0o600, flag: "wx" });
+    try {
+      // Avoid platform-specific directory-rename merge semantics when a
+      // canonical lock is already present. The existence check is only an
+      // optimization; a concurrent publisher is still handled by rename
+      // failure and staging-only cleanup below.
+      if (fs.existsSync(lockPath)) {
+        tryRecoverStaleInboxLock(lockPath);
+        throw new Error("canonical inbox lock exists");
+      }
+      fs.renameSync(stagingPath, lockPath);
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code === "EEXIST") tryRecoverStaleInboxLock(lockPath);
+      throw error;
+    }
     return { path: lockPath, token };
   } catch {
     try {
-      fs.rmSync(lockPath, { recursive: true, force: true });
+      // Only remove our private staging directory. Never recursively remove
+      // the canonical lock, which may now belong to another owner.
+      fs.rmSync(stagingPath, { recursive: true, force: true });
     } catch {
-      // Best effort cleanup if owner persistence failed.
+      // Best effort cleanup if initialization failed.
     }
     return null;
   }

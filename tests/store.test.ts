@@ -264,6 +264,60 @@ describe("store.processAllPendingMessages", () => {
     expect(fs.readFileSync(path.join(lockPath, "owner"), "utf-8")).toBe(`${process.pid}:new-token`);
   });
 
+  it("ignores abandoned lock initialization staging when a canonical owner exists", () => {
+    vi.useFakeTimers();
+    const root = createTempRoot();
+    const dirs = createDirs(root);
+    const inbox = path.join(dirs.inbox, "Self");
+    const ledger = path.join(dirs.base, "processed", "Self");
+    const lockPath = path.join(ledger, ".lock");
+    const stagingPath = path.join(ledger, ".lock-start-abandoned");
+    fs.mkdirSync(inbox, { recursive: true });
+    fs.mkdirSync(lockPath, { recursive: true });
+    fs.mkdirSync(stagingPath, { recursive: true });
+    fs.utimesSync(stagingPath, new Date(Date.now() - 20_000), new Date(Date.now() - 20_000));
+    fs.writeFileSync(path.join(lockPath, "owner"), `${process.pid}:canonical-owner`);
+    fs.writeFileSync(path.join(inbox, "staged-lock.json"), JSON.stringify({
+      id: "staged-lock-id",
+      from: "Peer",
+      to: "Self",
+      text: "canonical owner must survive",
+    }));
+
+    const delivered: string[] = [];
+    processAllPendingMessages(
+      { agentName: "Self", registered: true } as MessengerState,
+      dirs,
+      msg => delivered.push(msg.id),
+    );
+
+    expect(delivered).toEqual([]);
+    expect(fs.readFileSync(path.join(lockPath, "owner"), "utf-8")).toBe(`${process.pid}:canonical-owner`);
+    expect(fs.existsSync(stagingPath)).toBe(true);
+  });
+
+  it("keeps a live owner in a stale-looking lock directory", () => {
+    vi.useFakeTimers();
+    const root = createTempRoot();
+    const dirs = createDirs(root);
+    const inbox = path.join(dirs.inbox, "Self");
+    const ledger = path.join(dirs.base, "processed", "Self");
+    const lockPath = path.join(ledger, ".lock");
+    fs.mkdirSync(inbox, { recursive: true });
+    fs.mkdirSync(lockPath, { recursive: true });
+    fs.writeFileSync(path.join(lockPath, "owner"), `${process.pid}:published-owner`);
+    fs.utimesSync(lockPath, new Date(Date.now() - 20_000), new Date(Date.now() - 20_000));
+
+    processAllPendingMessages(
+      { agentName: "Self", registered: true } as MessengerState,
+      dirs,
+      () => { throw new Error("must not deliver while the live owner holds the lock"); },
+    );
+
+    expect(fs.readFileSync(path.join(lockPath, "owner"), "utf-8")).toBe(`${process.pid}:published-owner`);
+    expect(fs.existsSync(lockPath)).toBe(true);
+  });
+
   it("returns immediately on a lock miss and retries without blocking", () => {
     vi.useFakeTimers();
     const root = createTempRoot();
