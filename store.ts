@@ -1178,7 +1178,7 @@ function acquireInboxLock(ledgerPath: string): InboxLock | null {
       fs.renameSync(stagingPath, lockPath);
     } catch (error) {
       const code = (error as NodeJS.ErrnoException).code;
-      if (code === "EEXIST") tryRecoverStaleInboxLock(lockPath);
+      if (code === "EEXIST" || code === "ENOTEMPTY") tryRecoverStaleInboxLock(lockPath);
       throw error;
     }
     return { path: lockPath, token };
