@@ -1,7 +1,8 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { createHash } from "node:crypto";
+import { afterEach, describe, expect, it } from "vitest";
 import type { AgentRegistration, Dirs, MessengerState } from "../lib.ts";
 import {
   getActiveAgents,
@@ -256,27 +257,24 @@ describe("store.processAllPendingMessages", () => {
     }));
     const state = { agentName: "Self", registered: true } as MessengerState;
     let deliveries = 0;
-    const originalUnlinkSync = fs.unlinkSync;
-    let failSourceUnlink = true;
-    const unlinkSpy = vi.spyOn(fs, "unlinkSync").mockImplementation((filePath) => {
-      if (String(filePath) === messagePath && failSourceUnlink) {
-        failSourceUnlink = false;
-        throw new Error("simulated unlink failure");
-      }
-      return originalUnlinkSync(filePath);
+    const movedSourcePath = `${messagePath}.leftover`;
+    processAllPendingMessages(state, dirs, () => {
+      deliveries++;
+      // Replace the source path after delivery. The real unlink then fails on a
+      // directory, without redefining the ESM fs namespace.
+      fs.renameSync(messagePath, movedSourcePath);
+      fs.mkdirSync(messagePath);
     });
+    expect(deliveries).toBe(1);
+    expect(fs.statSync(messagePath).isDirectory()).toBe(true);
 
-    try {
-      processAllPendingMessages(state, dirs, () => { deliveries++; });
-      expect(deliveries).toBe(1);
-      expect(fs.existsSync(messagePath)).toBe(true);
-
-      processAllPendingMessages(state, dirs, () => { deliveries++; });
-      expect(deliveries).toBe(1);
-      expect(fs.existsSync(messagePath)).toBe(false);
-    } finally {
-      unlinkSpy.mockRestore();
-    }
+    // Restore the source before the next pass. The marker was already durable,
+    // so recovery removes it without redelivering.
+    fs.rmSync(messagePath, { recursive: true });
+    fs.renameSync(movedSourcePath, messagePath);
+    processAllPendingMessages(state, dirs, () => { deliveries++; });
+    expect(deliveries).toBe(1);
+    expect(fs.existsSync(messagePath)).toBe(false);
   });
 
   it("retains the source when processed marker persistence fails", () => {
@@ -293,22 +291,62 @@ describe("store.processAllPendingMessages", () => {
     }));
     const state = { agentName: "Self", registered: true } as MessengerState;
     let deliveries = 0;
-    const originalMkdirSync = fs.mkdirSync;
-    const mkdirSpy = vi.spyOn(fs, "mkdirSync").mockImplementation((dirPath, options) => {
-      if (String(dirPath).endsWith(path.join("processed", "Self"))) {
-        throw new Error("simulated marker persistence failure");
-      }
-      return originalMkdirSync(dirPath, options);
-    });
+    const ledger = path.join(dirs.base, "processed", "Self");
+    const markerName = `${createHash("sha256").update("marker-failure-id", "utf8").digest("hex")}.json`;
 
-    try {
-      processAllPendingMessages(state, dirs, () => { deliveries++; });
-      expect(deliveries).toBe(1);
-      expect(fs.existsSync(messagePath)).toBe(true);
-      expect(fs.existsSync(path.join(dirs.base, "processed", "Self"))).toBe(false);
-    } finally {
-      mkdirSpy.mockRestore();
-    }
+    processAllPendingMessages(state, dirs, () => {
+      deliveries++;
+      fs.mkdirSync(ledger, { recursive: true });
+      // Create the destination after the marker check, so atomic rename fails
+      // only when acknowledgement is persisted.
+      fs.mkdirSync(path.join(ledger, markerName));
+    });
+    expect(deliveries).toBe(1);
+    expect(fs.existsSync(messagePath)).toBe(true);
+  });
+
+  it("quarantines a same-id message whose payload fingerprint conflicts", () => {
+    const root = createTempRoot();
+    const dirs = createDirs(root);
+    const inbox = path.join(dirs.inbox, "Self");
+    fs.mkdirSync(inbox, { recursive: true });
+    const message = { id: "conflicting-id", from: "Peer", to: "Self", text: "first" };
+    fs.writeFileSync(path.join(inbox, "first.json"), JSON.stringify(message));
+    fs.writeFileSync(path.join(inbox, "second.json"), JSON.stringify({ ...message, text: "different" }));
+    const state = { agentName: "Self", registered: true } as MessengerState;
+    const delivered: string[] = [];
+
+    processAllPendingMessages(state, dirs, msg => delivered.push(msg.text));
+
+    expect(delivered).toEqual(["first"]);
+    const quarantine = path.join(inbox, "quarantine");
+    const reasonFiles = fs.readdirSync(quarantine).filter(file => file.endsWith(".reason"));
+    expect(reasonFiles).toHaveLength(1);
+    expect(JSON.parse(fs.readFileSync(path.join(quarantine, reasonFiles[0]), "utf-8")).reason)
+      .toContain("processed message ID conflict");
+  });
+
+  it("fails closed for a legacy marker without a payload fingerprint", () => {
+    const root = createTempRoot();
+    const dirs = createDirs(root);
+    const inbox = path.join(dirs.inbox, "Self");
+    const ledger = path.join(dirs.base, "processed", "Self");
+    fs.mkdirSync(inbox, { recursive: true });
+    fs.mkdirSync(ledger, { recursive: true });
+    const message = { id: "legacy-id", from: "Peer", to: "Self", text: "legacy" };
+    fs.writeFileSync(path.join(inbox, "legacy.json"), JSON.stringify(message));
+    const markerName = `${createHash("sha256").update("legacy-id", "utf8").digest("hex")}.json`;
+    fs.writeFileSync(path.join(ledger, markerName), JSON.stringify({ id: "legacy-id", processedAt: new Date().toISOString() }));
+    const delivered: string[] = [];
+
+    processAllPendingMessages({ agentName: "Self", registered: true } as MessengerState, dirs, msg => delivered.push(msg.id));
+
+    expect(delivered).toEqual([]);
+    expect(fs.existsSync(path.join(inbox, "legacy.json"))).toBe(false);
+    const quarantine = path.join(inbox, "quarantine");
+    const reasonFiles = fs.readdirSync(quarantine).filter(file => file.endsWith(".reason"));
+    expect(JSON.parse(fs.readFileSync(path.join(quarantine, reasonFiles[0]), "utf-8")).reason)
+      .toContain("legacy marker");
   });
 
   it("retains a failed delivery for retry and removes it after recovery", () => {
@@ -366,7 +404,7 @@ describe("store.processAllPendingMessages", () => {
     });
   });
 
-  it("bounds retries in memory when the retry sidecar cannot be written", () => {
+  it("durably quarantines when the retry sidecar cannot be written", () => {
     const root = createTempRoot();
     const dirs = createDirs(root);
     const inbox = path.join(dirs.inbox, "Self");
@@ -375,9 +413,7 @@ describe("store.processAllPendingMessages", () => {
     fs.mkdirSync(path.join(inbox, "sidecar.json.retry"));
     const state = { agentName: "Self", registered: true } as MessengerState;
 
-    for (let attempt = 0; attempt < 3; attempt++) {
-      processAllPendingMessages(state, dirs, () => { throw new Error("sidecar unavailable"); });
-    }
+    processAllPendingMessages(state, dirs, () => { throw new Error("sidecar unavailable"); });
 
     expect(fs.existsSync(path.join(inbox, "sidecar.json"))).toBe(false);
     expect(fs.readdirSync(path.join(inbox, "quarantine"))).toHaveLength(2);

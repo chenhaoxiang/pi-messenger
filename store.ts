@@ -100,12 +100,12 @@ function getGitBranch(cwd: string): string | undefined {
 }
 
 const LOCK_STALE_MS = 10000;
+const INBOX_LOCK_ATTEMPTS = 20;
+const INBOX_LOCK_RETRY_MS = 50;
 const MESSAGE_RETRY_LIMIT = 3;
 // Processed markers are kept outside inbox directories, retained for 30 days, and capped at 1024 per inbox.
 const PROCESSED_MARKER_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
 const MAX_PROCESSED_MARKERS = 1024;
-const MAX_IN_MEMORY_RETRY_TRACKS = 1024;
-const inMemoryMessageRetries = new Map<string, number>();
 const blockedInboxMessages = new WeakMap<MessengerState, string>();
 
 function writeJsonAtomically(filePath: string, data: unknown): void {
@@ -994,17 +994,103 @@ function processedMarkerPath(ledgerPath: string, messageId: string): string {
   return join(ledgerPath, `${key}.json`);
 }
 
-function hasProcessedMarker(ledgerPath: string, messageId: string): boolean {
+function messagePayloadFingerprint(msg: AgentMailMessage, timestampProvided = true): string {
+  // Keep the digest input explicit and stable: normalization makes equivalent legacy
+  // inbox records produce the same payload while excluding filesystem metadata. A
+  // generated timestamp is deliberately omitted, otherwise identical legacy records
+  // would conflict merely because they were scanned at different times.
+  const payload = JSON.stringify({
+    id: msg.id,
+    from: msg.from,
+    to: msg.to,
+    text: msg.text,
+    ...(timestampProvided ? { timestamp: msg.timestamp } : {}),
+    replyTo: msg.replyTo,
+    ...(msg.targetSessionId ? { targetSessionId: msg.targetSessionId } : {}),
+  });
+  return createHash("sha256").update(payload, "utf8").digest("hex");
+}
+
+type ProcessedMarkerStatus = "missing" | "same" | "conflict" | "legacy";
+
+function getProcessedMarkerStatus(
+  ledgerPath: string,
+  messageId: string,
+  fingerprint: string,
+): ProcessedMarkerStatus {
   const markerPath = processedMarkerPath(ledgerPath, messageId);
   try {
-    const marker = JSON.parse(fs.readFileSync(markerPath, "utf-8")) as { id?: unknown };
+    const marker = JSON.parse(fs.readFileSync(markerPath, "utf-8")) as {
+      id?: unknown;
+      payloadFingerprint?: unknown;
+    };
     if (marker.id !== messageId) {
       throw new Error(`processed marker identity mismatch for ${messageId}`);
     }
-    return true;
+    if (typeof marker.payloadFingerprint !== "string") return "legacy";
+    return marker.payloadFingerprint === fingerprint ? "same" : "conflict";
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return "missing";
     throw error;
+  }
+}
+
+interface InboxLock {
+  path: string;
+  token: string;
+}
+
+function sleepSync(milliseconds: number): void {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, milliseconds);
+}
+
+function tryRecoverStaleInboxLock(lockPath: string): void {
+  try {
+    const stat = fs.statSync(lockPath);
+    if (Date.now() - stat.mtimeMs <= LOCK_STALE_MS) return;
+    let pid = 0;
+    try {
+      const owner = fs.readFileSync(lockPath, "utf-8").split(":", 1)[0];
+      pid = Number.parseInt(owner, 10);
+    } catch {
+      // A stale lock with no readable owner is safe to recover.
+    }
+    if (pid && isProcessAlive(pid)) return;
+    fs.unlinkSync(lockPath);
+  } catch {
+    // The lock may have been released or replaced between operations.
+  }
+}
+
+function acquireInboxLock(ledgerPath: string): InboxLock | null {
+  try {
+    ensureDirSync(ledgerPath);
+  } catch {
+    return null;
+  }
+  const lockPath = join(ledgerPath, ".lock");
+  for (let attempt = 0; attempt < INBOX_LOCK_ATTEMPTS; attempt++) {
+    try {
+      const token = `${process.pid}:${randomUUID()}`;
+      const fd = fs.openSync(lockPath, fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY, 0o600);
+      fs.writeSync(fd, token);
+      fs.closeSync(fd);
+      return { path: lockPath, token };
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code !== "EEXIST") return null;
+      tryRecoverStaleInboxLock(lockPath);
+      if (attempt + 1 < INBOX_LOCK_ATTEMPTS) sleepSync(INBOX_LOCK_RETRY_MS);
+    }
+  }
+  return null;
+}
+
+function releaseInboxLock(lock: InboxLock): void {
+  try {
+    if (fs.readFileSync(lock.path, "utf-8") === lock.token) fs.unlinkSync(lock.path);
+  } catch {
+    // A crashed or stale-lock recovery path may already have removed it.
   }
 }
 
@@ -1045,16 +1131,17 @@ function pruneProcessedMarkers(ledgerPath: string): void {
   }
 }
 
-function persistProcessedMarker(ledgerPath: string, messageId: string): void {
+function persistProcessedMarker(ledgerPath: string, msg: AgentMailMessage, payloadFingerprint: string): void {
   ensureDirSync(ledgerPath);
-  writeJsonAtomically(processedMarkerPath(ledgerPath, messageId), {
-    id: messageId,
+  writeJsonAtomically(processedMarkerPath(ledgerPath, msg.id), {
+    id: msg.id,
+    payloadFingerprint,
     processedAt: new Date().toISOString(),
   });
   pruneProcessedMarkers(ledgerPath);
 }
 
-function recordMessageFailure(msgPath: string): number {
+function recordMessageFailure(msgPath: string): { attempts: number; persisted: boolean } {
   const retryPath = retryMetadataPath(msgPath);
   let persistedAttempts = 0;
   try {
@@ -1063,23 +1150,18 @@ function recordMessageFailure(msgPath: string): number {
     // First failure, or metadata was not readable.
   }
 
-  const previousAttempts = inMemoryMessageRetries.get(msgPath) ?? 0;
-  const attempts = Math.max(persistedAttempts, previousAttempts) + 1;
+  const attempts = persistedAttempts + 1;
   try {
     fs.writeFileSync(retryPath, String(attempts), { mode: 0o600 });
-    inMemoryMessageRetries.delete(msgPath);
+    return { attempts, persisted: true };
   } catch {
-    // Keep a bounded in-process count when the sidecar cannot be persisted.
-    if (!inMemoryMessageRetries.has(msgPath) && inMemoryMessageRetries.size >= MAX_IN_MEMORY_RETRY_TRACKS) {
-      return MESSAGE_RETRY_LIMIT;
-    }
-    inMemoryMessageRetries.set(msgPath, attempts);
+    // A process-local count cannot safely survive a consumer restart. The caller
+    // must quarantine or pause this message immediately instead of retrying it.
+    return { attempts, persisted: false };
   }
-  return attempts;
 }
 
 function clearMessageFailure(msgPath: string): void {
-  inMemoryMessageRetries.delete(msgPath);
   try {
     fs.unlinkSync(retryMetadataPath(msgPath));
   } catch {
@@ -1168,11 +1250,16 @@ export function processAllPendingMessages(
   }
 
   isProcessingMessages = true;
+  let inboxLock: InboxLock | null = null;
 
   try {
     const inbox = getMyInbox(state, dirs);
     if (!fs.existsSync(inbox)) return;
     const processedLedger = processedLedgerPath(inbox);
+    // This lock covers marker check, delivery, marker persistence, and source unlink.
+    // It is bounded so a watcher never waits forever on a crashed consumer.
+    inboxLock = acquireInboxLock(processedLedger);
+    if (!inboxLock) return;
     pruneProcessedMarkers(processedLedger);
 
     const blockedPath = blockedInboxMessages.get(state);
@@ -1193,15 +1280,34 @@ export function processAllPendingMessages(
       const msgPath = join(inbox, file);
       try {
         const content = fs.readFileSync(msgPath, "utf-8");
-        const msg = normalizeAgentMailMessage(JSON.parse(content), {
+        const raw = JSON.parse(content) as unknown;
+        const msg = normalizeAgentMailMessage(raw, {
           id: file.endsWith(".json") ? file.slice(0, -5) : file,
           from: "unknown",
           to: state.agentName,
           timestamp: new Date().toISOString(),
         });
-        if (hasProcessedMarker(processedLedger, msg.id)) {
+        const timestampProvided = Boolean(
+          raw && typeof raw === "object" && !Array.isArray(raw) &&
+          ("timestamp" in raw || "ts" in raw)
+        );
+        const fingerprint = messagePayloadFingerprint(msg, timestampProvided);
+        const markerStatus = getProcessedMarkerStatus(processedLedger, msg.id, fingerprint);
+        if (markerStatus === "same") {
           fs.unlinkSync(msgPath);
           clearMessageFailure(msgPath);
+          continue;
+        }
+        if (markerStatus === "conflict") {
+          if (!quarantineMessage(msgPath, `processed message ID conflict: payload fingerprint differs for ${msg.id}`)) {
+            throw new Error(`processed message ID conflict could not be quarantined for ${msg.id}`);
+          }
+          continue;
+        }
+        if (markerStatus === "legacy") {
+          if (!quarantineMessage(msgPath, `processed message ID conflict: legacy marker has no payload fingerprint for ${msg.id}`)) {
+            throw new Error(`legacy processed marker conflict could not be quarantined for ${msg.id}`);
+          }
           continue;
         }
         const targetSession = checkTargetSession(msg, dirs);
@@ -1217,16 +1323,21 @@ export function processAllPendingMessages(
         deliverFn(msg);
         // Persist the durable acknowledgement before unlinking the source message. If this fails,
         // the source remains retryable and no delivery is silently claimed as complete.
-        persistProcessedMarker(processedLedger, msg.id);
+        persistProcessedMarker(processedLedger, msg, fingerprint);
         fs.unlinkSync(msgPath);
         clearMessageFailure(msgPath);
       } catch (error) {
-        const attempts = recordMessageFailure(msgPath);
-        if (attempts >= MESSAGE_RETRY_LIMIT) {
-          const reason = error instanceof Error ? error.message : "message read or delivery failed";
-          if (!quarantineMessage(msgPath, reason)) {
+        const failure = recordMessageFailure(msgPath);
+        const reason = error instanceof Error ? error.message : "message read or delivery failed";
+        // Without a durable sidecar, retry state would reset after a restart. Fail
+        // closed by moving the message to durable quarantine immediately.
+        if (!failure.persisted || failure.attempts >= MESSAGE_RETRY_LIMIT) {
+          const quarantineReason = failure.persisted
+            ? reason
+            : `retry state could not be persisted; message paused: ${reason}`;
+          if (!quarantineMessage(msgPath, quarantineReason)) {
             blockedInboxMessages.set(state, msgPath);
-            console.error(`Pi Messenger inbox paused: could not quarantine ${msgPath}: ${reason}`);
+            console.error(`Pi Messenger inbox paused: could not quarantine ${msgPath}: ${quarantineReason}`);
             return;
           }
         }
@@ -1234,6 +1345,8 @@ export function processAllPendingMessages(
       }
     }
   } finally {
+    // The lock is intentionally released only after the complete inbox pass.
+    if (inboxLock) releaseInboxLock(inboxLock);
     isProcessingMessages = false;
 
     // Re-process if new calls came in while we were processing
