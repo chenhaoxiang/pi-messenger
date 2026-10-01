@@ -1,7 +1,7 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import type { AgentRegistration, Dirs, MessengerState } from "../lib.ts";
 import {
   getActiveAgents,
@@ -213,6 +213,102 @@ describe("store.processAllPendingMessages", () => {
       text: "Atomic body",
       targetSessionId: "session-1",
     });
+  });
+
+  it("delivers duplicate message ids once across duplicate files and reprocessing", () => {
+    const root = createTempRoot();
+    const dirs = createDirs(root);
+    const inbox = path.join(dirs.inbox, "Self");
+    fs.mkdirSync(inbox, { recursive: true });
+    const message = {
+      id: "stable-message-id",
+      from: "Peer",
+      to: "Self",
+      text: "Deliver once",
+      timestamp: new Date().toISOString(),
+    };
+    fs.writeFileSync(path.join(inbox, "first.json"), JSON.stringify(message));
+    fs.writeFileSync(path.join(inbox, "second.json"), JSON.stringify(message));
+    const state = { agentName: "Self", registered: true } as MessengerState;
+    const delivered: string[] = [];
+
+    processAllPendingMessages(state, dirs, msg => delivered.push(msg.id));
+    processAllPendingMessages(state, dirs, msg => delivered.push(msg.id));
+
+    expect(delivered).toEqual(["stable-message-id"]);
+    expect(fs.readdirSync(inbox)).toEqual([]);
+    const ledger = path.join(dirs.base, "processed", "Self");
+    expect(fs.readdirSync(ledger)).toHaveLength(1);
+    expect(fs.readdirSync(dirs.inbox)).toEqual(["Self"]);
+  });
+
+  it("uses the marker before unlink when a delivered source file is left behind", () => {
+    const root = createTempRoot();
+    const dirs = createDirs(root);
+    const inbox = path.join(dirs.inbox, "Self");
+    fs.mkdirSync(inbox, { recursive: true });
+    const messagePath = path.join(inbox, "leftover.json");
+    fs.writeFileSync(messagePath, JSON.stringify({
+      id: "leftover-message-id",
+      from: "Peer",
+      to: "Self",
+      text: "Leave source behind",
+    }));
+    const state = { agentName: "Self", registered: true } as MessengerState;
+    let deliveries = 0;
+    const originalUnlinkSync = fs.unlinkSync;
+    let failSourceUnlink = true;
+    const unlinkSpy = vi.spyOn(fs, "unlinkSync").mockImplementation((filePath) => {
+      if (String(filePath) === messagePath && failSourceUnlink) {
+        failSourceUnlink = false;
+        throw new Error("simulated unlink failure");
+      }
+      return originalUnlinkSync(filePath);
+    });
+
+    try {
+      processAllPendingMessages(state, dirs, () => { deliveries++; });
+      expect(deliveries).toBe(1);
+      expect(fs.existsSync(messagePath)).toBe(true);
+
+      processAllPendingMessages(state, dirs, () => { deliveries++; });
+      expect(deliveries).toBe(1);
+      expect(fs.existsSync(messagePath)).toBe(false);
+    } finally {
+      unlinkSpy.mockRestore();
+    }
+  });
+
+  it("retains the source when processed marker persistence fails", () => {
+    const root = createTempRoot();
+    const dirs = createDirs(root);
+    const inbox = path.join(dirs.inbox, "Self");
+    fs.mkdirSync(inbox, { recursive: true });
+    const messagePath = path.join(inbox, "marker-failure.json");
+    fs.writeFileSync(messagePath, JSON.stringify({
+      id: "marker-failure-id",
+      from: "Peer",
+      to: "Self",
+      text: "Marker must persist",
+    }));
+    const state = { agentName: "Self", registered: true } as MessengerState;
+    let deliveries = 0;
+    const originalMkdirSync = fs.mkdirSync;
+    const mkdirSpy = vi.spyOn(fs, "mkdirSync").mockImplementation((dirPath, options) => {
+      if (String(dirPath).endsWith(path.join("processed", "Self"))) {
+        throw new Error("simulated marker persistence failure");
+      }
+      return originalMkdirSync(dirPath, options);
+    });
+
+    try {
+      processAllPendingMessages(state, dirs, () => { deliveries++; });
+      expect(deliveries).toBe(1);
+      expect(fs.existsSync(messagePath)).toBe(true);
+      expect(fs.existsSync(path.join(dirs.base, "processed", "Self"))).toBe(false);
+    } finally {
+      mkdirSpy.mockRestore();
+    }
   });
 
   it("retains a failed delivery for retry and removes it after recovery", () => {

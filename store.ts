@@ -3,7 +3,7 @@
  */
 
 import * as fs from "node:fs";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { basename, dirname, join, resolve } from "node:path";
 import { execSync } from "node:child_process";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -101,6 +101,9 @@ function getGitBranch(cwd: string): string | undefined {
 
 const LOCK_STALE_MS = 10000;
 const MESSAGE_RETRY_LIMIT = 3;
+// Processed markers are kept outside inbox directories, retained for 30 days, and capped at 1024 per inbox.
+const PROCESSED_MARKER_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
+const MAX_PROCESSED_MARKERS = 1024;
 const MAX_IN_MEMORY_RETRY_TRACKS = 1024;
 const inMemoryMessageRetries = new Map<string, number>();
 const blockedInboxMessages = new WeakMap<MessengerState, string>();
@@ -981,6 +984,76 @@ function retryMetadataPath(msgPath: string): string {
   return `${msgPath}.retry`;
 }
 
+function processedLedgerPath(inbox: string): string {
+  // Keep the ledger beside the shared inbox directory, not inside an inbox scan root.
+  return join(dirname(dirname(inbox)), "processed", basename(inbox));
+}
+
+function processedMarkerPath(ledgerPath: string, messageId: string): string {
+  const key = createHash("sha256").update(messageId, "utf8").digest("hex");
+  return join(ledgerPath, `${key}.json`);
+}
+
+function hasProcessedMarker(ledgerPath: string, messageId: string): boolean {
+  const markerPath = processedMarkerPath(ledgerPath, messageId);
+  try {
+    const marker = JSON.parse(fs.readFileSync(markerPath, "utf-8")) as { id?: unknown };
+    if (marker.id !== messageId) {
+      throw new Error(`processed marker identity mismatch for ${messageId}`);
+    }
+    return true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+    throw error;
+  }
+}
+
+function pruneProcessedMarkers(ledgerPath: string): void {
+  try {
+    const now = Date.now();
+    const entries = fs.readdirSync(ledgerPath)
+      .filter(file => file.endsWith(".json"))
+      .map(file => {
+        const markerPath = join(ledgerPath, file);
+        return { markerPath, mtimeMs: fs.statSync(markerPath).mtimeMs };
+      });
+
+    for (const entry of entries) {
+      if (now - entry.mtimeMs > PROCESSED_MARKER_RETENTION_MS) {
+        try {
+          fs.unlinkSync(entry.markerPath);
+        } catch {
+          // Best effort retention cleanup.
+        }
+      }
+    }
+
+    const remaining = entries
+      .filter(entry => fs.existsSync(entry.markerPath))
+      .sort((a, b) => a.mtimeMs - b.mtimeMs);
+    while (remaining.length > MAX_PROCESSED_MARKERS) {
+      const oldest = remaining.shift();
+      if (!oldest) break;
+      try {
+        fs.unlinkSync(oldest.markerPath);
+      } catch {
+        // Best effort retention cleanup.
+      }
+    }
+  } catch {
+    // Marker persistence has already succeeded; cleanup must not make delivery less durable.
+  }
+}
+
+function persistProcessedMarker(ledgerPath: string, messageId: string): void {
+  ensureDirSync(ledgerPath);
+  writeJsonAtomically(processedMarkerPath(ledgerPath, messageId), {
+    id: messageId,
+    processedAt: new Date().toISOString(),
+  });
+  pruneProcessedMarkers(ledgerPath);
+}
+
 function recordMessageFailure(msgPath: string): number {
   const retryPath = retryMetadataPath(msgPath);
   let persistedAttempts = 0;
@@ -1099,6 +1172,8 @@ export function processAllPendingMessages(
   try {
     const inbox = getMyInbox(state, dirs);
     if (!fs.existsSync(inbox)) return;
+    const processedLedger = processedLedgerPath(inbox);
+    pruneProcessedMarkers(processedLedger);
 
     const blockedPath = blockedInboxMessages.get(state);
     if (blockedPath) {
@@ -1124,6 +1199,11 @@ export function processAllPendingMessages(
           to: state.agentName,
           timestamp: new Date().toISOString(),
         });
+        if (hasProcessedMarker(processedLedger, msg.id)) {
+          fs.unlinkSync(msgPath);
+          clearMessageFailure(msgPath);
+          continue;
+        }
         const targetSession = checkTargetSession(msg, dirs);
         if (targetSession === "mismatch") {
           if (!quarantineMessage(msgPath, "target session is no longer active for this agent name")) {
@@ -1135,6 +1215,9 @@ export function processAllPendingMessages(
           throw new Error("target registration is temporarily unreadable");
         }
         deliverFn(msg);
+        // Persist the durable acknowledgement before unlinking the source message. If this fails,
+        // the source remains retryable and no delivery is silently claimed as complete.
+        persistProcessedMarker(processedLedger, msg.id);
         fs.unlinkSync(msgPath);
         clearMessageFailure(msgPath);
       } catch (error) {
