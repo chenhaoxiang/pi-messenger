@@ -170,7 +170,9 @@ describe("store.processAllPendingMessages", () => {
     fs.mkdirSync(inbox, { recursive: true });
     fs.mkdirSync(lockPath, { recursive: true });
     fs.writeFileSync(path.join(lockPath, "owner"), "2147483647:stale-token");
+    fs.writeFileSync(path.join(lockPath, "recovery"), "2147483647:stale-recovery");
     fs.utimesSync(lockPath, new Date(Date.now() - 20_000), new Date(Date.now() - 20_000));
+    fs.utimesSync(path.join(lockPath, "recovery"), new Date(Date.now() - 20_000), new Date(Date.now() - 20_000));
     fs.writeFileSync(path.join(inbox, "stale-lock.json"), JSON.stringify({
       id: "stale-lock-id",
       from: "Peer",
@@ -190,7 +192,7 @@ describe("store.processAllPendingMessages", () => {
     expect(fs.existsSync(lockPath)).toBe(false);
   });
 
-  it("does not remove a stale-looking lock owned by a live process", () => {
+  it("does not remove a stale lock with a live recovery winner", () => {
     vi.useFakeTimers();
     const root = createTempRoot();
     const dirs = createDirs(root);
@@ -199,8 +201,10 @@ describe("store.processAllPendingMessages", () => {
     const lockPath = path.join(ledger, ".lock");
     fs.mkdirSync(inbox, { recursive: true });
     fs.mkdirSync(lockPath, { recursive: true });
-    fs.writeFileSync(path.join(lockPath, "owner"), `${process.pid}:live-token`);
+    fs.writeFileSync(path.join(lockPath, "owner"), "2147483647:stale-owner");
+    fs.writeFileSync(path.join(lockPath, "recovery"), `${process.pid}:active-recovery`);
     fs.utimesSync(lockPath, new Date(Date.now() - 20_000), new Date(Date.now() - 20_000));
+    fs.utimesSync(path.join(lockPath, "recovery"), new Date(Date.now() - 20_000), new Date(Date.now() - 20_000));
 
     processAllPendingMessages(
       { agentName: "Self", registered: true } as MessengerState,

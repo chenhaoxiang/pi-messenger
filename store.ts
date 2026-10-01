@@ -1042,26 +1042,83 @@ interface InboxLock {
 function tryRecoverStaleInboxLock(lockPath: string): void {
   try {
     const stat = fs.statSync(lockPath);
-    if (Date.now() - stat.mtimeMs <= LOCK_STALE_MS) return;
+    if (!stat.isDirectory() || Date.now() - stat.mtimeMs <= LOCK_STALE_MS) return;
 
     let pid = 0;
     try {
-      const ownerPath = stat.isDirectory() ? join(lockPath, "owner") : lockPath;
-      const owner = fs.readFileSync(ownerPath, "utf-8").split(":", 1)[0];
+      const owner = fs.readFileSync(join(lockPath, "owner"), "utf-8").split(":", 1)[0];
       pid = Number.parseInt(owner, 10);
     } catch {
       // A stale lock with no readable owner is safe to recover.
     }
     if (pid && isProcessAlive(pid)) return;
 
-    // The lock is a directory so a new owner cannot create .lock while this
-    // entry exists. Rename the exact stale directory atomically, then remove
-    // only the claimed entry; never unlink lockPath after the stale check.
+    // Recovery itself is serialized by a fixed marker inside the old lock.
+    // Only the marker creator, or the one process that atomically claims a
+    // dead marker and installs a replacement marker, may rename the lock.
+    const markerPath = join(lockPath, "recovery");
+    const markerToken = `${process.pid}:${randomUUID()}`;
+    let recoveryPath = markerPath;
+    try {
+      fs.writeFileSync(markerPath, markerToken, { mode: 0o600, flag: "wx" });
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") return;
+      let markerStat: fs.Stats;
+      let existingToken: string;
+      try {
+        markerStat = fs.statSync(markerPath);
+        existingToken = fs.readFileSync(markerPath, "utf-8");
+      } catch {
+        // The prior recovery marker disappeared; the next retry can compete.
+        return;
+      }
+      if (Date.now() - markerStat.mtimeMs <= LOCK_STALE_MS) return;
+      const markerPid = Number.parseInt(existingToken.split(":", 1)[0], 10);
+      if (markerPid && isProcessAlive(markerPid)) return;
+
+      // Claim a dead marker atomically. If another process wins this rename,
+      // it is the only process allowed to continue with the old lock.
+      const claimedMarkerPath = `${markerPath}.stale-${process.pid}-${randomUUID()}`;
+      try {
+        fs.renameSync(markerPath, claimedMarkerPath);
+        if (fs.readFileSync(claimedMarkerPath, "utf-8") !== existingToken) return;
+        fs.writeFileSync(markerPath, markerToken, { mode: 0o600, flag: "wx" });
+        recoveryPath = markerPath;
+      } catch {
+        try { fs.unlinkSync(claimedMarkerPath); } catch { /* Best effort. */ }
+        return;
+      }
+    }
+
+    // Re-check identity after winning recovery. A contender may have already
+    // renamed the old directory and installed a new .lock while this process
+    // was reading the old entry. Never rename a different inode.
+    let currentStat: fs.Stats;
+    try {
+      currentStat = fs.statSync(lockPath);
+    } catch {
+      try { fs.unlinkSync(recoveryPath); } catch { /* Best effort. */ }
+      return;
+    }
+    if (currentStat.dev !== stat.dev || currentStat.ino !== stat.ino) {
+      try {
+        if (fs.readFileSync(recoveryPath, "utf-8") === markerToken) fs.unlinkSync(recoveryPath);
+      } catch {
+        // The marker moved with the claimed old directory or was already removed.
+      }
+      return;
+    }
+
     const claimedPath = `${lockPath}.stale-${process.pid}-${randomUUID()}`;
     try {
       fs.renameSync(lockPath, claimedPath);
     } catch {
-      // Another contender either claimed the stale lock or installed a new one.
+      // Another recovery winner claimed the lock, or a new owner was installed.
+      try {
+        if (fs.readFileSync(recoveryPath, "utf-8") === markerToken) fs.unlinkSync(recoveryPath);
+      } catch {
+        // The marker may have moved with another claimed directory.
+      }
       return;
     }
     try {
@@ -1069,6 +1126,8 @@ function tryRecoverStaleInboxLock(lockPath: string): void {
     } catch {
       // The claimed stale entry remains isolated from any current lock.
     }
+    // recoveryPath and the marker are inside claimedPath, so the cleanup above
+    // removes only the stale directory and cannot touch a new .lock.
   } catch {
     // The lock may have been released or replaced between operations.
   }
