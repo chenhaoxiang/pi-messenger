@@ -287,6 +287,37 @@ describe("store.processAllPendingMessages", () => {
     expect(fs.readdirSync(path.join(inbox, "quarantine"))).toHaveLength(2);
   });
 
+  it("uses a non-JSON fallback dead letter when quarantine setup fails", () => {
+    const root = createTempRoot();
+    const dirs = createDirs(root);
+    const inbox = path.join(dirs.inbox, "Self");
+    fs.mkdirSync(inbox, { recursive: true });
+    const messagePath = path.join(inbox, "dead-letter.json");
+    fs.writeFileSync(messagePath, JSON.stringify({ from: "Peer", to: "Self", text: "Dead letter" }));
+    fs.writeFileSync(path.join(inbox, "quarantine"), "not a directory");
+    const state = { agentName: "Self", registered: true } as MessengerState;
+    let deliveries = 0;
+
+    for (let attempt = 0; attempt < 3; attempt++) {
+      processAllPendingMessages(state, dirs, () => {
+        deliveries++;
+        throw new Error("permanent failure");
+      });
+    }
+
+    const fallbackFiles = fs.readdirSync(inbox).filter(file => file.endsWith(".dead-letter"));
+    expect(fallbackFiles).toHaveLength(1);
+    const fallbackPath = path.join(inbox, fallbackFiles[0]);
+    expect(fs.existsSync(messagePath)).toBe(false);
+    expect(fs.existsSync(fallbackPath)).toBe(true);
+    expect(fallbackPath.endsWith(".json")).toBe(false);
+    expect(fs.existsSync(`${fallbackPath}.reason`)).toBe(true);
+
+    processAllPendingMessages(state, dirs, () => { deliveries++; });
+    expect(deliveries).toBe(3);
+    expect(JSON.parse(fs.readFileSync(fallbackPath, "utf-8"))).toMatchObject({ text: "Dead letter" });
+  });
+
   it("keeps registration JSON valid across create, update, and activity flush", () => {
     const root = createTempRoot();
     const dirs = createDirs(root);

@@ -1032,10 +1032,19 @@ function quarantineMessage(msgPath: string, reason: string): boolean {
     }
     return true;
   } catch {
-    // Fall back to a sibling non-JSON dead-letter file if quarantine setup fails.
+    // Fall back to a sibling dead-letter file whose suffix cannot be scanned as inbox JSON.
+    const fallbackPath = `${msgPath}.quarantined-${quarantineName}.dead-letter`;
     try {
-      fs.renameSync(msgPath, `${msgPath}.quarantined-${quarantineName}`);
+      fs.renameSync(msgPath, fallbackPath);
       clearMessageFailure(msgPath);
+      try {
+        writeJsonAtomically(`${fallbackPath}.reason`, {
+          reason,
+          quarantinedAt: new Date().toISOString(),
+        });
+      } catch {
+        // The fallback message remains durable even if its evidence sidecar cannot be written.
+      }
       return true;
     } catch {
       // Leave the original message in place if no durable quarantine is possible.
