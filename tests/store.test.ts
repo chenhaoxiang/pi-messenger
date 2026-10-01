@@ -2,7 +2,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { createHash } from "node:crypto";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import type { AgentRegistration, Dirs, MessengerState } from "../lib.ts";
 import {
   getActiveAgents,
@@ -12,6 +12,7 @@ import {
   updateRegistration,
   flushActivityToRegistry,
   sendMessageToAgent,
+  stopWatcher,
 } from "../store.ts";
 
 const roots = new Set<string>();
@@ -84,6 +85,7 @@ function writeRegistration(registryDir: string, name: string, cwd: string): void
 }
 
 afterEach(() => {
+  vi.useRealTimers();
   invalidateAgentsCache();
   process.chdir(initialCwd);
   for (const root of roots) {
@@ -158,6 +160,137 @@ describe("store.getActiveAgents cwd scoping", () => {
 });
 
 describe("store.processAllPendingMessages", () => {
+  it("recovers a stale directory lock on the asynchronous retry", () => {
+    vi.useFakeTimers();
+    const root = createTempRoot();
+    const dirs = createDirs(root);
+    const inbox = path.join(dirs.inbox, "Self");
+    const ledger = path.join(dirs.base, "processed", "Self");
+    const lockPath = path.join(ledger, ".lock");
+    fs.mkdirSync(inbox, { recursive: true });
+    fs.mkdirSync(lockPath, { recursive: true });
+    fs.writeFileSync(path.join(lockPath, "owner"), "2147483647:stale-token");
+    fs.utimesSync(lockPath, new Date(Date.now() - 20_000), new Date(Date.now() - 20_000));
+    fs.writeFileSync(path.join(inbox, "stale-lock.json"), JSON.stringify({
+      id: "stale-lock-id",
+      from: "Peer",
+      to: "Self",
+      text: "recover me",
+    }));
+
+    const delivered: string[] = [];
+    const state = { agentName: "Self", registered: true } as MessengerState;
+    processAllPendingMessages(state, dirs, msg => delivered.push(msg.id));
+
+    expect(delivered).toEqual([]);
+    expect(fs.existsSync(lockPath)).toBe(false);
+    vi.advanceTimersByTime(10_000);
+
+    expect(delivered).toEqual(["stale-lock-id"]);
+    expect(fs.existsSync(lockPath)).toBe(false);
+  });
+
+  it("does not remove a stale-looking lock owned by a live process", () => {
+    vi.useFakeTimers();
+    const root = createTempRoot();
+    const dirs = createDirs(root);
+    const inbox = path.join(dirs.inbox, "Self");
+    const ledger = path.join(dirs.base, "processed", "Self");
+    const lockPath = path.join(ledger, ".lock");
+    fs.mkdirSync(inbox, { recursive: true });
+    fs.mkdirSync(lockPath, { recursive: true });
+    fs.writeFileSync(path.join(lockPath, "owner"), `${process.pid}:live-token`);
+    fs.utimesSync(lockPath, new Date(Date.now() - 20_000), new Date(Date.now() - 20_000));
+
+    processAllPendingMessages(
+      { agentName: "Self", registered: true } as MessengerState,
+      dirs,
+      () => { throw new Error("must not deliver while another owner holds the lock"); },
+    );
+
+    expect(fs.existsSync(lockPath)).toBe(true);
+  });
+
+  it("cancels a lock retry when the watcher stops", () => {
+    vi.useFakeTimers();
+    const root = createTempRoot();
+    const dirs = createDirs(root);
+    const inbox = path.join(dirs.inbox, "Self");
+    const ledger = path.join(dirs.base, "processed", "Self");
+    const lockPath = path.join(ledger, ".lock");
+    fs.mkdirSync(inbox, { recursive: true });
+    fs.mkdirSync(lockPath, { recursive: true });
+    fs.writeFileSync(path.join(lockPath, "owner"), `${process.pid}:other-token`);
+    fs.writeFileSync(path.join(inbox, "stopped.json"), JSON.stringify({
+      id: "stopped-id",
+      from: "Peer",
+      to: "Self",
+      text: "do not retry",
+    }));
+
+    const delivered: string[] = [];
+    const state = { agentName: "Self", registered: true, watcher: null } as MessengerState;
+    processAllPendingMessages(state, dirs, msg => delivered.push(msg.id));
+    stopWatcher(state);
+    fs.rmSync(lockPath, { recursive: true, force: true });
+    vi.advanceTimersByTime(10_000);
+
+    expect(delivered).toEqual([]);
+    expect(fs.existsSync(path.join(inbox, "stopped.json"))).toBe(true);
+  });
+
+  it("does not remove a new owner lock after stale recovery", () => {
+    vi.useFakeTimers();
+    const root = createTempRoot();
+    const dirs = createDirs(root);
+    const inbox = path.join(dirs.inbox, "Self");
+    const ledger = path.join(dirs.base, "processed", "Self");
+    const lockPath = path.join(ledger, ".lock");
+    fs.mkdirSync(inbox, { recursive: true });
+    fs.mkdirSync(lockPath, { recursive: true });
+    fs.writeFileSync(path.join(lockPath, "owner"), "2147483647:stale-token");
+    fs.utimesSync(lockPath, new Date(Date.now() - 20_000), new Date(Date.now() - 20_000));
+
+    const state = { agentName: "Self", registered: true } as MessengerState;
+    processAllPendingMessages(state, dirs, () => { throw new Error("must not deliver"); });
+    fs.mkdirSync(lockPath, { recursive: true });
+    fs.writeFileSync(path.join(lockPath, "owner"), `${process.pid}:new-token`);
+
+    vi.advanceTimersByTime(10_000);
+    expect(fs.readFileSync(path.join(lockPath, "owner"), "utf-8")).toBe(`${process.pid}:new-token`);
+  });
+
+  it("returns immediately on a lock miss and retries without blocking", () => {
+    vi.useFakeTimers();
+    const root = createTempRoot();
+    const dirs = createDirs(root);
+    const inbox = path.join(dirs.inbox, "Self");
+    const ledger = path.join(dirs.base, "processed", "Self");
+    const lockPath = path.join(ledger, ".lock");
+    fs.mkdirSync(inbox, { recursive: true });
+    fs.mkdirSync(lockPath, { recursive: true });
+    fs.writeFileSync(path.join(lockPath, "owner"), `${process.pid}:other-token`);
+    fs.writeFileSync(path.join(inbox, "timer.json"), JSON.stringify({
+      id: "timer-id",
+      from: "Peer",
+      to: "Self",
+      text: "retry later",
+    }));
+
+    const delivered: string[] = [];
+    const state = { agentName: "Self", registered: true } as MessengerState;
+    processAllPendingMessages(state, dirs, msg => delivered.push(msg.id));
+    expect(delivered).toEqual([]);
+    expect(fs.existsSync(lockPath)).toBe(true);
+
+    vi.advanceTimersByTime(9_999);
+    expect(delivered).toEqual([]);
+    fs.rmSync(lockPath, { recursive: true, force: true });
+    vi.advanceTimersByTime(1);
+
+    expect(delivered).toEqual(["timer-id"]);
+  });
+
   it("normalizes message and ts fields before delivery", () => {
     const root = createTempRoot();
     const dirs = createDirs(root);

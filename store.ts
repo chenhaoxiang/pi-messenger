@@ -100,8 +100,6 @@ function getGitBranch(cwd: string): string | undefined {
 }
 
 const LOCK_STALE_MS = 10000;
-const INBOX_LOCK_ATTEMPTS = 20;
-const INBOX_LOCK_RETRY_MS = 50;
 const MESSAGE_RETRY_LIMIT = 3;
 // Processed markers are kept outside inbox directories, retained for 30 days, and capped at 1024 per inbox.
 const PROCESSED_MARKER_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
@@ -1041,25 +1039,24 @@ interface InboxLock {
   token: string;
 }
 
-function sleepSync(milliseconds: number): void {
-  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, milliseconds);
-}
-
 function tryRecoverStaleInboxLock(lockPath: string): void {
   try {
     const stat = fs.statSync(lockPath);
     if (Date.now() - stat.mtimeMs <= LOCK_STALE_MS) return;
+
     let pid = 0;
     try {
-      const owner = fs.readFileSync(lockPath, "utf-8").split(":", 1)[0];
+      const ownerPath = stat.isDirectory() ? join(lockPath, "owner") : lockPath;
+      const owner = fs.readFileSync(ownerPath, "utf-8").split(":", 1)[0];
       pid = Number.parseInt(owner, 10);
     } catch {
       // A stale lock with no readable owner is safe to recover.
     }
     if (pid && isProcessAlive(pid)) return;
 
-    // Claim the exact directory entry before deleting it. Never unlink lockPath
-    // after a stale check: another consumer may have replaced it with a new lock.
+    // The lock is a directory so a new owner cannot create .lock while this
+    // entry exists. Rename the exact stale directory atomically, then remove
+    // only the claimed entry; never unlink lockPath after the stale check.
     const claimedPath = `${lockPath}.stale-${process.pid}-${randomUUID()}`;
     try {
       fs.renameSync(lockPath, claimedPath);
@@ -1067,29 +1064,10 @@ function tryRecoverStaleInboxLock(lockPath: string): void {
       // Another contender either claimed the stale lock or installed a new one.
       return;
     }
-    let claimedStat: fs.Stats;
     try {
-      claimedStat = fs.statSync(claimedPath);
+      fs.rmSync(claimedPath, { recursive: true, force: true });
     } catch {
-      try { fs.unlinkSync(claimedPath); } catch { /* Best effort. */ }
-      return;
-    }
-    if (claimedStat.dev !== stat.dev || claimedStat.ino !== stat.ino) {
-      // The entry changed between stat and rename. Restore the claimed entry
-      // without overwriting a lock that another consumer may have installed.
-      try {
-        fs.linkSync(claimedPath, lockPath);
-        fs.unlinkSync(claimedPath);
-      } catch {
-        // Keep the claimed entry if lockPath is occupied: it may be a new
-        // owner's lock and must not be deleted by stale recovery.
-      }
-      return;
-    }
-    try {
-      fs.unlinkSync(claimedPath);
-    } catch {
-      // The claimed stale entry is no longer on disk; lockPath was not touched.
+      // The claimed stale entry remains isolated from any current lock.
     }
   } catch {
     // The lock may have been released or replaced between operations.
@@ -1102,27 +1080,42 @@ function acquireInboxLock(ledgerPath: string): InboxLock | null {
   } catch {
     return null;
   }
+
   const lockPath = join(ledgerPath, ".lock");
-  for (let attempt = 0; attempt < INBOX_LOCK_ATTEMPTS; attempt++) {
-    try {
-      const token = `${process.pid}:${randomUUID()}`;
-      const fd = fs.openSync(lockPath, fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY, 0o600);
-      fs.writeSync(fd, token);
-      fs.closeSync(fd);
-      return { path: lockPath, token };
-    } catch (error) {
-      const code = (error as NodeJS.ErrnoException).code;
-      if (code !== "EEXIST") return null;
-      tryRecoverStaleInboxLock(lockPath);
-      if (attempt + 1 < INBOX_LOCK_ATTEMPTS) sleepSync(INBOX_LOCK_RETRY_MS);
-    }
+  const token = `${process.pid}:${randomUUID()}`;
+  try {
+    // mkdir is the ownership operation: it keeps .lock occupied throughout
+    // stale recovery and avoids a file replacement window.
+    fs.mkdirSync(lockPath, { mode: 0o700 });
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "EEXIST") tryRecoverStaleInboxLock(lockPath);
+    return null;
   }
-  return null;
+
+  try {
+    fs.writeFileSync(join(lockPath, "owner"), token, { mode: 0o600, flag: "wx" });
+    return { path: lockPath, token };
+  } catch {
+    try {
+      fs.rmSync(lockPath, { recursive: true, force: true });
+    } catch {
+      // Best effort cleanup if owner persistence failed.
+    }
+    return null;
+  }
 }
 
 function releaseInboxLock(lock: InboxLock): void {
   try {
-    if (fs.readFileSync(lock.path, "utf-8") === lock.token) fs.unlinkSync(lock.path);
+    const ownerPath = join(lock.path, "owner");
+    if (fs.readFileSync(ownerPath, "utf-8") !== lock.token) return;
+    // Remove the owner marker first, then remove only the now-empty directory.
+    // A stale recovery can rename this directory between these operations, but
+    // a new owner cannot install .lock until this directory is gone; rmdir
+    // therefore cannot remove a replacement lock.
+    fs.unlinkSync(ownerPath);
+    fs.rmdirSync(lock.path);
   } catch {
     // A crashed or stale-lock recovery path may already have removed it.
   }
@@ -1309,12 +1302,12 @@ function scheduleInboxLockRetry(
   deliverFn: (msg: AgentMailMessage) => void,
 ): void {
   if (inboxLockRetryTimers.has(state)) return;
-  // A bounded lock wait can finish before a crashed owner's stale threshold.
-  // Retry asynchronously after that threshold without blocking the watcher.
+  // Retry asynchronously after the stale threshold without blocking the
+  // watcher or keeping the process alive on its own.
   const timer = setTimeout(() => {
     inboxLockRetryTimers.delete(state);
     processAllPendingMessages(state, dirs, deliverFn);
-  }, LOCK_STALE_MS + INBOX_LOCK_ATTEMPTS * INBOX_LOCK_RETRY_MS);
+  }, LOCK_STALE_MS);
   (timer as unknown as { unref?: () => void }).unref?.();
   inboxLockRetryTimers.set(state, timer);
 }
@@ -1348,7 +1341,7 @@ export function processAllPendingMessages(
     if (!fs.existsSync(inbox)) return;
     const processedLedger = processedLedgerPath(inbox);
     // This lock covers marker check, delivery, marker persistence, and source unlink.
-    // It is bounded so a watcher never waits forever on a crashed consumer.
+    // A miss returns immediately; the unref'd retry timer handles stale owners.
     inboxLock = acquireInboxLock(processedLedger);
     if (!inboxLock) {
       scheduleInboxLockRetry(state, dirs, deliverFn);
