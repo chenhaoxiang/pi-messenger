@@ -104,9 +104,8 @@ const MESSAGE_RETRY_LIMIT = 3;
 // Processed markers are kept outside inbox directories, retained for 30 days, and capped at 1024 per inbox.
 const PROCESSED_MARKER_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
 const MAX_PROCESSED_MARKERS = 1024;
-const MAX_IN_MEMORY_RETRY_TRACKS = 1024;
-const inMemoryMessageRetries = new Map<string, number>();
 const blockedInboxMessages = new WeakMap<MessengerState, string>();
+const inboxLockRetryTimers = new WeakMap<MessengerState, ReturnType<typeof setTimeout>>();
 
 function writeJsonAtomically(filePath: string, data: unknown): void {
   const tempPath = `${filePath}.tmp-${process.pid}-${randomUUID()}`;
@@ -994,17 +993,219 @@ function processedMarkerPath(ledgerPath: string, messageId: string): string {
   return join(ledgerPath, `${key}.json`);
 }
 
-function hasProcessedMarker(ledgerPath: string, messageId: string): boolean {
+function messagePayloadFingerprint(msg: AgentMailMessage, timestampProvided = true): string {
+  // Keep the digest input explicit and stable: normalization makes equivalent legacy
+  // inbox records produce the same payload while excluding filesystem metadata. A
+  // generated timestamp is deliberately omitted, otherwise identical legacy records
+  // would conflict merely because they were scanned at different times.
+  const payload = JSON.stringify({
+    id: msg.id,
+    from: msg.from,
+    to: msg.to,
+    text: msg.text,
+    ...(timestampProvided ? { timestamp: msg.timestamp } : {}),
+    replyTo: msg.replyTo,
+    ...(msg.targetSessionId ? { targetSessionId: msg.targetSessionId } : {}),
+  });
+  return createHash("sha256").update(payload, "utf8").digest("hex");
+}
+
+type ProcessedMarkerStatus = "missing" | "same" | "conflict" | "legacy";
+
+function getProcessedMarkerStatus(
+  ledgerPath: string,
+  messageId: string,
+  fingerprint: string,
+): ProcessedMarkerStatus {
   const markerPath = processedMarkerPath(ledgerPath, messageId);
   try {
-    const marker = JSON.parse(fs.readFileSync(markerPath, "utf-8")) as { id?: unknown };
+    const marker = JSON.parse(fs.readFileSync(markerPath, "utf-8")) as {
+      id?: unknown;
+      payloadFingerprint?: unknown;
+    };
     if (marker.id !== messageId) {
       throw new Error(`processed marker identity mismatch for ${messageId}`);
     }
-    return true;
+    if (typeof marker.payloadFingerprint !== "string") return "legacy";
+    return marker.payloadFingerprint === fingerprint ? "same" : "conflict";
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return "missing";
     throw error;
+  }
+}
+
+interface InboxLock {
+  path: string;
+  token: string;
+}
+
+function tryRecoverStaleInboxLock(lockPath: string): void {
+  try {
+    const stat = fs.statSync(lockPath);
+    if (!stat.isDirectory() || Date.now() - stat.mtimeMs <= LOCK_STALE_MS) return;
+
+    let pid = 0;
+    try {
+      const owner = fs.readFileSync(join(lockPath, "owner"), "utf-8").split(":", 1)[0];
+      pid = Number.parseInt(owner, 10);
+    } catch {
+      // A stale lock with no readable owner is safe to recover.
+    }
+    if (pid && isProcessAlive(pid)) return;
+
+    // Recovery itself is serialized by a fixed marker inside the old lock.
+    // Only the marker creator, or the one process that atomically claims a
+    // dead marker and installs a replacement marker, may rename the lock.
+    const markerPath = join(lockPath, "recovery");
+    const markerToken = `${process.pid}:${randomUUID()}`;
+    let recoveryPath = markerPath;
+    try {
+      fs.writeFileSync(markerPath, markerToken, { mode: 0o600, flag: "wx" });
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") return;
+      let markerStat: fs.Stats;
+      let existingToken: string;
+      try {
+        markerStat = fs.statSync(markerPath);
+        existingToken = fs.readFileSync(markerPath, "utf-8");
+      } catch {
+        // The prior recovery marker disappeared; the next retry can compete.
+        return;
+      }
+      if (Date.now() - markerStat.mtimeMs <= LOCK_STALE_MS) return;
+      const markerPid = Number.parseInt(existingToken.split(":", 1)[0], 10);
+      if (markerPid && isProcessAlive(markerPid)) return;
+
+      // Claim a dead marker atomically. If another process wins this rename,
+      // it is the only process allowed to continue with the old lock.
+      const claimedMarkerPath = `${markerPath}.stale-${process.pid}-${randomUUID()}`;
+      try {
+        fs.renameSync(markerPath, claimedMarkerPath);
+        if (fs.readFileSync(claimedMarkerPath, "utf-8") !== existingToken) return;
+        fs.writeFileSync(markerPath, markerToken, { mode: 0o600, flag: "wx" });
+        recoveryPath = markerPath;
+      } catch {
+        try { fs.unlinkSync(claimedMarkerPath); } catch { /* Best effort. */ }
+        return;
+      }
+    }
+
+    // Re-check identity after winning recovery. A contender may have already
+    // renamed the old directory and installed a new .lock while this process
+    // was reading the old entry. Never rename a different inode.
+    let currentStat: fs.Stats;
+    try {
+      currentStat = fs.statSync(lockPath);
+    } catch {
+      try { fs.unlinkSync(recoveryPath); } catch { /* Best effort. */ }
+      return;
+    }
+    if (currentStat.dev !== stat.dev || currentStat.ino !== stat.ino) {
+      try {
+        if (fs.readFileSync(recoveryPath, "utf-8") === markerToken) fs.unlinkSync(recoveryPath);
+      } catch {
+        // The marker moved with the claimed old directory or was already removed.
+      }
+      return;
+    }
+
+    // The owner may have been published after the initial owner-less check,
+    // while the recovery marker kept other recoverers out. Re-read ownership
+    // immediately before claiming the directory; inode identity alone is not
+    // enough because the owner file can change in place.
+    try {
+      const owner = fs.readFileSync(join(lockPath, "owner"), "utf-8");
+      const ownerPid = Number.parseInt(owner.split(":", 1)[0], 10);
+      if (ownerPid && isProcessAlive(ownerPid)) {
+        if (fs.readFileSync(recoveryPath, "utf-8") === markerToken) fs.unlinkSync(recoveryPath);
+        return;
+      }
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+        // An unreadable owner is handled like the initial stale-owner check.
+      }
+    }
+
+    const claimedPath = `${lockPath}.stale-${process.pid}-${randomUUID()}`;
+    try {
+      fs.renameSync(lockPath, claimedPath);
+    } catch {
+      // Another recovery winner claimed the lock, or a new owner was installed.
+      try {
+        if (fs.readFileSync(recoveryPath, "utf-8") === markerToken) fs.unlinkSync(recoveryPath);
+      } catch {
+        // The marker may have moved with another claimed directory.
+      }
+      return;
+    }
+    try {
+      fs.rmSync(claimedPath, { recursive: true, force: true });
+    } catch {
+      // The claimed stale entry remains isolated from any current lock.
+    }
+    // recoveryPath and the marker are inside claimedPath, so the cleanup above
+    // removes only the stale directory and cannot touch a new .lock.
+  } catch {
+    // The lock may have been released or replaced between operations.
+  }
+}
+
+function acquireInboxLock(ledgerPath: string): InboxLock | null {
+  try {
+    ensureDirSync(ledgerPath);
+  } catch {
+    return null;
+  }
+
+  const lockPath = join(ledgerPath, ".lock");
+  const token = `${process.pid}:${randomUUID()}`;
+  // Initialize ownership away from the canonical name. This prevents stale
+  // recovery from mistaking an owner-less initialization directory for a live
+  // lock, and ensures failed cleanup can never remove another owner's lock.
+  const stagingPath = join(ledgerPath, `.lock-start-${process.pid}-${randomUUID()}`);
+  try {
+    fs.mkdirSync(stagingPath, { mode: 0o700 });
+    fs.writeFileSync(join(stagingPath, "owner"), token, { mode: 0o600, flag: "wx" });
+    try {
+      // Avoid platform-specific directory-rename merge semantics when a
+      // canonical lock is already present. The existence check is only an
+      // optimization; a concurrent publisher is still handled by rename
+      // failure and staging-only cleanup below.
+      if (fs.existsSync(lockPath)) {
+        tryRecoverStaleInboxLock(lockPath);
+        throw new Error("canonical inbox lock exists");
+      }
+      fs.renameSync(stagingPath, lockPath);
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code === "EEXIST" || code === "ENOTEMPTY") tryRecoverStaleInboxLock(lockPath);
+      throw error;
+    }
+    return { path: lockPath, token };
+  } catch {
+    try {
+      // Only remove our private staging directory. Never recursively remove
+      // the canonical lock, which may now belong to another owner.
+      fs.rmSync(stagingPath, { recursive: true, force: true });
+    } catch {
+      // Best effort cleanup if initialization failed.
+    }
+    return null;
+  }
+}
+
+function releaseInboxLock(lock: InboxLock): void {
+  try {
+    const ownerPath = join(lock.path, "owner");
+    if (fs.readFileSync(ownerPath, "utf-8") !== lock.token) return;
+    // Remove the owner marker first, then remove only the now-empty directory.
+    // A stale recovery can rename this directory between these operations, but
+    // a new owner cannot install .lock until this directory is gone; rmdir
+    // therefore cannot remove a replacement lock.
+    fs.unlinkSync(ownerPath);
+    fs.rmdirSync(lock.path);
+  } catch {
+    // A crashed or stale-lock recovery path may already have removed it.
   }
 }
 
@@ -1045,16 +1246,17 @@ function pruneProcessedMarkers(ledgerPath: string): void {
   }
 }
 
-function persistProcessedMarker(ledgerPath: string, messageId: string): void {
+function persistProcessedMarker(ledgerPath: string, msg: AgentMailMessage, payloadFingerprint: string): void {
   ensureDirSync(ledgerPath);
-  writeJsonAtomically(processedMarkerPath(ledgerPath, messageId), {
-    id: messageId,
+  writeJsonAtomically(processedMarkerPath(ledgerPath, msg.id), {
+    id: msg.id,
+    payloadFingerprint,
     processedAt: new Date().toISOString(),
   });
   pruneProcessedMarkers(ledgerPath);
 }
 
-function recordMessageFailure(msgPath: string): number {
+function recordMessageFailure(msgPath: string): { attempts: number; persisted: boolean } {
   const retryPath = retryMetadataPath(msgPath);
   let persistedAttempts = 0;
   try {
@@ -1063,27 +1265,55 @@ function recordMessageFailure(msgPath: string): number {
     // First failure, or metadata was not readable.
   }
 
-  const previousAttempts = inMemoryMessageRetries.get(msgPath) ?? 0;
-  const attempts = Math.max(persistedAttempts, previousAttempts) + 1;
+  const attempts = persistedAttempts + 1;
   try {
     fs.writeFileSync(retryPath, String(attempts), { mode: 0o600 });
-    inMemoryMessageRetries.delete(msgPath);
+    return { attempts, persisted: true };
   } catch {
-    // Keep a bounded in-process count when the sidecar cannot be persisted.
-    if (!inMemoryMessageRetries.has(msgPath) && inMemoryMessageRetries.size >= MAX_IN_MEMORY_RETRY_TRACKS) {
-      return MESSAGE_RETRY_LIMIT;
-    }
-    inMemoryMessageRetries.set(msgPath, attempts);
+    // A process-local count cannot safely survive a consumer restart. The caller
+    // must quarantine or pause this message immediately instead of retrying it.
+    return { attempts, persisted: false };
   }
-  return attempts;
 }
 
 function clearMessageFailure(msgPath: string): void {
-  inMemoryMessageRetries.delete(msgPath);
   try {
     fs.unlinkSync(retryMetadataPath(msgPath));
   } catch {
     // No retry metadata is normal.
+  }
+}
+
+function pausedLedgerPath(inbox: string): string {
+  return join(dirname(dirname(inbox)), "paused", basename(inbox));
+}
+
+function pausedMessagePath(inbox: string, msgPath: string): string {
+  const key = createHash("sha256").update(msgPath, "utf8").digest("hex");
+  return join(pausedLedgerPath(inbox), `${key}.json`);
+}
+
+function isPausedInboxMessage(inbox: string, msgPath: string): boolean {
+  try {
+    return fs.existsSync(pausedMessagePath(inbox, msgPath));
+  } catch {
+    return false;
+  }
+}
+
+function recordPausedInboxMessage(inbox: string, msgPath: string, messageId: string, reason: string): boolean {
+  try {
+    const ledger = pausedLedgerPath(inbox);
+    ensureDirSync(ledger);
+    writeJsonAtomically(pausedMessagePath(inbox, msgPath), {
+      messagePath: msgPath,
+      messageId,
+      reason,
+      pausedAt: new Date().toISOString(),
+    });
+    return true;
+  } catch {
+    return false;
   }
 }
 
@@ -1154,6 +1384,30 @@ function checkTargetSession(msg: AgentMailMessage, dirs: Dirs): "not-bound" | "m
   return target.status === "missing" ? "mismatch" : "unavailable";
 }
 
+function scheduleInboxLockRetry(
+  state: MessengerState,
+  dirs: Dirs,
+  deliverFn: (msg: AgentMailMessage) => void,
+): void {
+  if (inboxLockRetryTimers.has(state)) return;
+  // Retry asynchronously after the stale threshold without blocking the
+  // watcher or keeping the process alive on its own.
+  const timer = setTimeout(() => {
+    inboxLockRetryTimers.delete(state);
+    processAllPendingMessages(state, dirs, deliverFn);
+  }, LOCK_STALE_MS);
+  (timer as unknown as { unref?: () => void }).unref?.();
+  inboxLockRetryTimers.set(state, timer);
+}
+
+function clearInboxLockRetry(state: MessengerState): void {
+  const timer = inboxLockRetryTimers.get(state);
+  if (timer) {
+    clearTimeout(timer);
+    inboxLockRetryTimers.delete(state);
+  }
+}
+
 export function processAllPendingMessages(
   state: MessengerState,
   dirs: Dirs,
@@ -1168,11 +1422,20 @@ export function processAllPendingMessages(
   }
 
   isProcessingMessages = true;
+  let inboxLock: InboxLock | null = null;
 
   try {
     const inbox = getMyInbox(state, dirs);
     if (!fs.existsSync(inbox)) return;
     const processedLedger = processedLedgerPath(inbox);
+    // This lock covers marker check, delivery, marker persistence, and source unlink.
+    // A miss returns immediately; the unref'd retry timer handles stale owners.
+    inboxLock = acquireInboxLock(processedLedger);
+    if (!inboxLock) {
+      scheduleInboxLockRetry(state, dirs, deliverFn);
+      return;
+    }
+    clearInboxLockRetry(state);
     pruneProcessedMarkers(processedLedger);
 
     const blockedPath = blockedInboxMessages.get(state);
@@ -1191,17 +1454,40 @@ export function processAllPendingMessages(
 
     for (const file of files) {
       const msgPath = join(inbox, file);
+      let messageId = file.endsWith(".json") ? file.slice(0, -5) : file;
+      if (isPausedInboxMessage(inbox, msgPath)) continue;
       try {
         const content = fs.readFileSync(msgPath, "utf-8");
-        const msg = normalizeAgentMailMessage(JSON.parse(content), {
-          id: file.endsWith(".json") ? file.slice(0, -5) : file,
+        const raw = JSON.parse(content) as unknown;
+        const msg = normalizeAgentMailMessage(raw, {
+          id: messageId,
           from: "unknown",
           to: state.agentName,
           timestamp: new Date().toISOString(),
         });
-        if (hasProcessedMarker(processedLedger, msg.id)) {
+        messageId = msg.id;
+        const timestampProvided = Boolean(
+          raw && typeof raw === "object" && !Array.isArray(raw) &&
+          (typeof (raw as Record<string, unknown>).timestamp === "string" ||
+            typeof (raw as Record<string, unknown>).ts === "string")
+        );
+        const fingerprint = messagePayloadFingerprint(msg, timestampProvided);
+        const markerStatus = getProcessedMarkerStatus(processedLedger, msg.id, fingerprint);
+        if (markerStatus === "same") {
           fs.unlinkSync(msgPath);
           clearMessageFailure(msgPath);
+          continue;
+        }
+        if (markerStatus === "conflict") {
+          if (!quarantineMessage(msgPath, `processed message ID conflict: payload fingerprint differs for ${msg.id}`)) {
+            throw new Error(`processed message ID conflict could not be quarantined for ${msg.id}`);
+          }
+          continue;
+        }
+        if (markerStatus === "legacy") {
+          if (!quarantineMessage(msgPath, `processed message ID conflict: legacy marker has no payload fingerprint for ${msg.id}`)) {
+            throw new Error(`legacy processed marker conflict could not be quarantined for ${msg.id}`);
+          }
           continue;
         }
         const targetSession = checkTargetSession(msg, dirs);
@@ -1217,16 +1503,25 @@ export function processAllPendingMessages(
         deliverFn(msg);
         // Persist the durable acknowledgement before unlinking the source message. If this fails,
         // the source remains retryable and no delivery is silently claimed as complete.
-        persistProcessedMarker(processedLedger, msg.id);
+        persistProcessedMarker(processedLedger, msg, fingerprint);
         fs.unlinkSync(msgPath);
         clearMessageFailure(msgPath);
       } catch (error) {
-        const attempts = recordMessageFailure(msgPath);
-        if (attempts >= MESSAGE_RETRY_LIMIT) {
-          const reason = error instanceof Error ? error.message : "message read or delivery failed";
-          if (!quarantineMessage(msgPath, reason)) {
-            blockedInboxMessages.set(state, msgPath);
-            console.error(`Pi Messenger inbox paused: could not quarantine ${msgPath}: ${reason}`);
+        const failure = recordMessageFailure(msgPath);
+        const reason = error instanceof Error ? error.message : "message read or delivery failed";
+        // Without a durable sidecar, retry state would reset after a restart. Fail
+        // closed by moving the message to durable quarantine immediately.
+        if (!failure.persisted || failure.attempts >= MESSAGE_RETRY_LIMIT) {
+          const quarantineReason = failure.persisted
+            ? reason
+            : `retry state could not be persisted; message paused: ${reason}`;
+          if (!quarantineMessage(msgPath, quarantineReason)) {
+            if (!recordPausedInboxMessage(inbox, msgPath, messageId, quarantineReason)) {
+              blockedInboxMessages.set(state, msgPath);
+              console.error(`Pi Messenger inbox paused: could not quarantine or persist pause for ${msgPath}: ${quarantineReason}`);
+            } else {
+              console.error(`Pi Messenger inbox paused durably: could not quarantine ${msgPath}: ${quarantineReason}`);
+            }
             return;
           }
         }
@@ -1234,6 +1529,8 @@ export function processAllPendingMessages(
       }
     }
   } finally {
+    // The lock is intentionally released only after the complete inbox pass.
+    if (inboxLock) releaseInboxLock(inboxLock);
     isProcessingMessages = false;
 
     // Re-process if new calls came in while we were processing
@@ -1334,6 +1631,7 @@ export function startWatcher(
 }
 
 export function stopWatcher(state: MessengerState): void {
+  clearInboxLockRetry(state);
   if (state.watcherDebounceTimer) {
     clearTimeout(state.watcherDebounceTimer);
     state.watcherDebounceTimer = null;
