@@ -107,6 +107,7 @@ const MESSAGE_RETRY_LIMIT = 3;
 const PROCESSED_MARKER_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
 const MAX_PROCESSED_MARKERS = 1024;
 const blockedInboxMessages = new WeakMap<MessengerState, string>();
+const inboxLockRetryTimers = new WeakMap<MessengerState, ReturnType<typeof setTimeout>>();
 
 function writeJsonAtomically(filePath: string, data: unknown): void {
   const tempPath = `${filePath}.tmp-${process.pid}-${randomUUID()}`;
@@ -1056,7 +1057,40 @@ function tryRecoverStaleInboxLock(lockPath: string): void {
       // A stale lock with no readable owner is safe to recover.
     }
     if (pid && isProcessAlive(pid)) return;
-    fs.unlinkSync(lockPath);
+
+    // Claim the exact directory entry before deleting it. Never unlink lockPath
+    // after a stale check: another consumer may have replaced it with a new lock.
+    const claimedPath = `${lockPath}.stale-${process.pid}-${randomUUID()}`;
+    try {
+      fs.renameSync(lockPath, claimedPath);
+    } catch {
+      // Another contender either claimed the stale lock or installed a new one.
+      return;
+    }
+    let claimedStat: fs.Stats;
+    try {
+      claimedStat = fs.statSync(claimedPath);
+    } catch {
+      try { fs.unlinkSync(claimedPath); } catch { /* Best effort. */ }
+      return;
+    }
+    if (claimedStat.dev !== stat.dev || claimedStat.ino !== stat.ino) {
+      // The entry changed between stat and rename. Restore the claimed entry
+      // without overwriting a lock that another consumer may have installed.
+      try {
+        fs.linkSync(claimedPath, lockPath);
+        fs.unlinkSync(claimedPath);
+      } catch {
+        // Keep the claimed entry if lockPath is occupied: it may be a new
+        // owner's lock and must not be deleted by stale recovery.
+      }
+      return;
+    }
+    try {
+      fs.unlinkSync(claimedPath);
+    } catch {
+      // The claimed stale entry is no longer on disk; lockPath was not touched.
+    }
   } catch {
     // The lock may have been released or replaced between operations.
   }
@@ -1169,6 +1203,39 @@ function clearMessageFailure(msgPath: string): void {
   }
 }
 
+function pausedLedgerPath(inbox: string): string {
+  return join(dirname(dirname(inbox)), "paused", basename(inbox));
+}
+
+function pausedMessagePath(inbox: string, msgPath: string): string {
+  const key = createHash("sha256").update(msgPath, "utf8").digest("hex");
+  return join(pausedLedgerPath(inbox), `${key}.json`);
+}
+
+function isPausedInboxMessage(inbox: string, msgPath: string): boolean {
+  try {
+    return fs.existsSync(pausedMessagePath(inbox, msgPath));
+  } catch {
+    return false;
+  }
+}
+
+function recordPausedInboxMessage(inbox: string, msgPath: string, messageId: string, reason: string): boolean {
+  try {
+    const ledger = pausedLedgerPath(inbox);
+    ensureDirSync(ledger);
+    writeJsonAtomically(pausedMessagePath(inbox, msgPath), {
+      messagePath: msgPath,
+      messageId,
+      reason,
+      pausedAt: new Date().toISOString(),
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 function quarantineMessage(msgPath: string, reason: string): boolean {
   const quarantineName = `${Date.now()}-${randomUUID()}-${basename(msgPath)}`;
   try {
@@ -1236,6 +1303,30 @@ function checkTargetSession(msg: AgentMailMessage, dirs: Dirs): "not-bound" | "m
   return target.status === "missing" ? "mismatch" : "unavailable";
 }
 
+function scheduleInboxLockRetry(
+  state: MessengerState,
+  dirs: Dirs,
+  deliverFn: (msg: AgentMailMessage) => void,
+): void {
+  if (inboxLockRetryTimers.has(state)) return;
+  // A bounded lock wait can finish before a crashed owner's stale threshold.
+  // Retry asynchronously after that threshold without blocking the watcher.
+  const timer = setTimeout(() => {
+    inboxLockRetryTimers.delete(state);
+    processAllPendingMessages(state, dirs, deliverFn);
+  }, LOCK_STALE_MS + INBOX_LOCK_ATTEMPTS * INBOX_LOCK_RETRY_MS);
+  (timer as unknown as { unref?: () => void }).unref?.();
+  inboxLockRetryTimers.set(state, timer);
+}
+
+function clearInboxLockRetry(state: MessengerState): void {
+  const timer = inboxLockRetryTimers.get(state);
+  if (timer) {
+    clearTimeout(timer);
+    inboxLockRetryTimers.delete(state);
+  }
+}
+
 export function processAllPendingMessages(
   state: MessengerState,
   dirs: Dirs,
@@ -1259,7 +1350,11 @@ export function processAllPendingMessages(
     // This lock covers marker check, delivery, marker persistence, and source unlink.
     // It is bounded so a watcher never waits forever on a crashed consumer.
     inboxLock = acquireInboxLock(processedLedger);
-    if (!inboxLock) return;
+    if (!inboxLock) {
+      scheduleInboxLockRetry(state, dirs, deliverFn);
+      return;
+    }
+    clearInboxLockRetry(state);
     pruneProcessedMarkers(processedLedger);
 
     const blockedPath = blockedInboxMessages.get(state);
@@ -1278,18 +1373,22 @@ export function processAllPendingMessages(
 
     for (const file of files) {
       const msgPath = join(inbox, file);
+      let messageId = file.endsWith(".json") ? file.slice(0, -5) : file;
+      if (isPausedInboxMessage(inbox, msgPath)) continue;
       try {
         const content = fs.readFileSync(msgPath, "utf-8");
         const raw = JSON.parse(content) as unknown;
         const msg = normalizeAgentMailMessage(raw, {
-          id: file.endsWith(".json") ? file.slice(0, -5) : file,
+          id: messageId,
           from: "unknown",
           to: state.agentName,
           timestamp: new Date().toISOString(),
         });
+        messageId = msg.id;
         const timestampProvided = Boolean(
           raw && typeof raw === "object" && !Array.isArray(raw) &&
-          ("timestamp" in raw || "ts" in raw)
+          (typeof (raw as Record<string, unknown>).timestamp === "string" ||
+            typeof (raw as Record<string, unknown>).ts === "string")
         );
         const fingerprint = messagePayloadFingerprint(msg, timestampProvided);
         const markerStatus = getProcessedMarkerStatus(processedLedger, msg.id, fingerprint);
@@ -1336,8 +1435,12 @@ export function processAllPendingMessages(
             ? reason
             : `retry state could not be persisted; message paused: ${reason}`;
           if (!quarantineMessage(msgPath, quarantineReason)) {
-            blockedInboxMessages.set(state, msgPath);
-            console.error(`Pi Messenger inbox paused: could not quarantine ${msgPath}: ${quarantineReason}`);
+            if (!recordPausedInboxMessage(inbox, msgPath, messageId, quarantineReason)) {
+              blockedInboxMessages.set(state, msgPath);
+              console.error(`Pi Messenger inbox paused: could not quarantine or persist pause for ${msgPath}: ${quarantineReason}`);
+            } else {
+              console.error(`Pi Messenger inbox paused durably: could not quarantine ${msgPath}: ${quarantineReason}`);
+            }
             return;
           }
         }
@@ -1447,6 +1550,7 @@ export function startWatcher(
 }
 
 export function stopWatcher(state: MessengerState): void {
+  clearInboxLockRetry(state);
   if (state.watcherDebounceTimer) {
     clearTimeout(state.watcherDebounceTimer);
     state.watcherDebounceTimer = null;

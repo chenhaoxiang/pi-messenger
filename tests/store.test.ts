@@ -277,6 +277,64 @@ describe("store.processAllPendingMessages", () => {
     expect(fs.existsSync(messagePath)).toBe(false);
   });
 
+  it("keeps a non-string timestamp out of the durable fingerprint", () => {
+    const root = createTempRoot();
+    const dirs = createDirs(root);
+    const inbox = path.join(dirs.inbox, "Self");
+    fs.mkdirSync(inbox, { recursive: true });
+    const messagePath = path.join(inbox, "non-string-timestamp.json");
+    fs.writeFileSync(messagePath, JSON.stringify({
+      id: "non-string-timestamp-id",
+      from: "Peer",
+      to: "Self",
+      text: "Stable payload",
+      timestamp: 12345,
+    }));
+    const state = { agentName: "Self", registered: true } as MessengerState;
+    let deliveries = 0;
+    const leftoverPath = `${messagePath}.leftover`;
+
+    processAllPendingMessages(state, dirs, () => {
+      deliveries++;
+      fs.renameSync(messagePath, leftoverPath);
+      fs.mkdirSync(messagePath);
+    });
+    fs.rmSync(messagePath, { recursive: true });
+    fs.renameSync(leftoverPath, messagePath);
+    processAllPendingMessages({ agentName: "Self", registered: true } as MessengerState, dirs, () => {
+      deliveries++;
+    });
+
+    expect(deliveries).toBe(1);
+    expect(fs.existsSync(messagePath)).toBe(false);
+  });
+
+  it("durably pauses a message when both quarantine paths fail", () => {
+    const root = createTempRoot();
+    const dirs = createDirs(root);
+    const inbox = path.join(dirs.inbox, "Self");
+    fs.mkdirSync(inbox, { recursive: true });
+    const messagePath = path.join(inbox, "pause.json");
+    fs.writeFileSync(messagePath, JSON.stringify({ from: "Peer", to: "Self", text: "Pause me" }));
+    fs.mkdirSync(`${messagePath}.retry`);
+    processAllPendingMessages({ agentName: "Self", registered: true } as MessengerState, dirs, () => {
+      fs.unlinkSync(messagePath);
+      throw new Error("permanent failure");
+    });
+
+    const pausedDir = path.join(dirs.base, "paused", "Self");
+    expect(fs.readdirSync(pausedDir)).toHaveLength(1);
+    const pauseRecord = JSON.parse(fs.readFileSync(path.join(pausedDir, fs.readdirSync(pausedDir)[0]), "utf-8"));
+    expect(pauseRecord).toMatchObject({ messageId: "pause", messagePath });
+    fs.writeFileSync(messagePath, JSON.stringify({ from: "Peer", to: "Self", text: "Pause me" }));
+    let deliveries = 0;
+    processAllPendingMessages({ agentName: "Self", registered: true } as MessengerState, dirs, () => {
+      deliveries++;
+    });
+    expect(deliveries).toBe(0);
+    expect(fs.existsSync(messagePath)).toBe(true);
+  });
+
   it("retains the source when processed marker persistence fails", () => {
     const root = createTempRoot();
     const dirs = createDirs(root);
