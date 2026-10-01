@@ -10,7 +10,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
-import { writeInboxMessageAtomically } from "../store.ts";
+import { writeTargetInboxMessageAtomically } from "../store.ts";
 import { discoverCrewAgents, type CrewAgentConfig } from "./utils/discover.ts";
 import { truncateOutput } from "./utils/truncate.ts";
 import {
@@ -389,15 +389,14 @@ async function runAgent(
             const inboxDir = path.join(options.messengerDirs.inbox, discoveredWorkerName);
             if (fs.existsSync(inboxDir)) {
               const msgFile = path.join(inboxDir, `${Date.now()}-shutdown.json`);
-              writeInboxMessageAtomically(msgFile, {
+              messageSent = writeTargetInboxMessageAtomically(msgFile, {
                 id: randomUUID(),
                 from: "crew-orchestrator",
                 to: discoveredWorkerName,
                 text: SHUTDOWN_MESSAGE,
                 timestamp: new Date().toISOString(),
                 replyTo: null,
-              });
-              messageSent = true;
+              }, discoveredWorkerName, options.messengerDirs);
             }
           } catch {}
         }

@@ -101,6 +101,9 @@ function getGitBranch(cwd: string): string | undefined {
 
 const LOCK_STALE_MS = 10000;
 const MESSAGE_RETRY_LIMIT = 3;
+const MAX_IN_MEMORY_RETRY_TRACKS = 1024;
+const inMemoryMessageRetries = new Map<string, number>();
+const blockedInboxMessages = new WeakMap<MessengerState, string>();
 
 function writeJsonAtomically(filePath: string, data: unknown): void {
   const tempPath = `${filePath}.tmp-${process.pid}-${randomUUID()}`;
@@ -120,6 +123,19 @@ function writeJsonAtomically(filePath: string, data: unknown): void {
 /** Write an inbox message without exposing a partially-written final JSON file. */
 export function writeInboxMessageAtomically(filePath: string, message: unknown): void {
   writeJsonAtomically(filePath, message);
+}
+
+/** Write only when the target has a readable, non-empty current session identity. */
+export function writeTargetInboxMessageAtomically(
+  filePath: string,
+  message: Record<string, unknown>,
+  to: string,
+  dirs: Pick<Dirs, "registry">,
+): boolean {
+  const target = lookupTargetSession(to, dirs.registry);
+  if (target.status !== "available") return false;
+  writeJsonAtomically(filePath, { ...message, targetSessionId: target.sessionId });
+  return true;
 }
 
 async function withSwarmLock<T>(baseDir: string, fn: () => T): Promise<T> {
@@ -351,14 +367,6 @@ export function register(state: MessengerState, dirs: Dirs, ctx: ExtensionContex
     }
 
     const regPath = getRegistrationPath(state, dirs);
-    if (fs.existsSync(regPath)) {
-      try {
-        fs.unlinkSync(regPath);
-      } catch {
-        // Ignore
-      }
-    }
-
     ensureDirSync(getMyInbox(state, dirs));
 
     const cwd = normalizeCwd(ctx.cwd);
@@ -379,7 +387,7 @@ export function register(state: MessengerState, dirs: Dirs, ctx: ExtensionContex
     };
 
     try {
-      fs.writeFileSync(regPath, JSON.stringify(registration, null, 2));
+      writeJsonAtomically(regPath, registration);
     } catch (err) {
       if (ctx.hasUI) {
         const msg = err instanceof Error ? err.message : "unknown error";
@@ -459,7 +467,7 @@ export function updateRegistration(state: MessengerState, dirs: Dirs, ctx: Exten
     reg.session = { ...state.session };
     reg.activity = { ...state.activity };
     reg.statusMessage = state.statusMessage;
-    fs.writeFileSync(regPath, JSON.stringify(reg, null, 2));
+    writeJsonAtomically(regPath, reg);
   } catch {
     // Ignore errors
   }
@@ -480,7 +488,7 @@ export function flushActivityToRegistry(state: MessengerState, dirs: Dirs, ctx: 
     reg.session = { ...state.session };
     reg.activity = { ...state.activity };
     reg.statusMessage = state.statusMessage;
-    fs.writeFileSync(regPath, JSON.stringify(reg, null, 2));
+    writeJsonAtomically(regPath, reg);
   } catch {
     // Ignore errors
   }
@@ -566,7 +574,7 @@ export function renameAgent(
   ensureDirSync(dirs.registry);
   
   try {
-    fs.writeFileSync(join(dirs.registry, `${newName}.json`), JSON.stringify(registration, null, 2));
+    writeJsonAtomically(join(dirs.registry, `${newName}.json`), registration);
   } catch (err) {
     return { success: false, error: "invalid_name" as const };
   }
@@ -975,22 +983,30 @@ function retryMetadataPath(msgPath: string): string {
 
 function recordMessageFailure(msgPath: string): number {
   const retryPath = retryMetadataPath(msgPath);
-  let attempts = 0;
+  let persistedAttempts = 0;
   try {
-    attempts = Number.parseInt(fs.readFileSync(retryPath, "utf-8"), 10) || 0;
+    persistedAttempts = Number.parseInt(fs.readFileSync(retryPath, "utf-8"), 10) || 0;
   } catch {
     // First failure, or metadata was not readable.
   }
-  attempts++;
+
+  const previousAttempts = inMemoryMessageRetries.get(msgPath) ?? 0;
+  const attempts = Math.max(persistedAttempts, previousAttempts) + 1;
   try {
     fs.writeFileSync(retryPath, String(attempts), { mode: 0o600 });
+    inMemoryMessageRetries.delete(msgPath);
   } catch {
-    // The message itself remains durable even if retry metadata cannot be written.
+    // Keep a bounded in-process count when the sidecar cannot be persisted.
+    if (!inMemoryMessageRetries.has(msgPath) && inMemoryMessageRetries.size >= MAX_IN_MEMORY_RETRY_TRACKS) {
+      return MESSAGE_RETRY_LIMIT;
+    }
+    inMemoryMessageRetries.set(msgPath, attempts);
   }
   return attempts;
 }
 
 function clearMessageFailure(msgPath: string): void {
+  inMemoryMessageRetries.delete(msgPath);
   try {
     fs.unlinkSync(retryMetadataPath(msgPath));
   } catch {
@@ -998,11 +1014,12 @@ function clearMessageFailure(msgPath: string): void {
   }
 }
 
-function quarantineMessage(msgPath: string, reason: string): void {
-  const quarantineDir = join(dirname(msgPath), "quarantine");
-  ensureDirSync(quarantineDir);
-  const destination = join(quarantineDir, `${Date.now()}-${randomUUID()}-${basename(msgPath)}`);
+function quarantineMessage(msgPath: string, reason: string): boolean {
+  const quarantineName = `${Date.now()}-${randomUUID()}-${basename(msgPath)}`;
   try {
+    const quarantineDir = join(dirname(msgPath), "quarantine");
+    ensureDirSync(quarantineDir);
+    const destination = join(quarantineDir, quarantineName);
     fs.renameSync(msgPath, destination);
     clearMessageFailure(msgPath);
     try {
@@ -1013,24 +1030,46 @@ function quarantineMessage(msgPath: string, reason: string): void {
     } catch {
       // The quarantined message remains durable even if its evidence sidecar cannot be written.
     }
+    return true;
   } catch {
-    // If quarantine fails, leave the original message for a later processing attempt.
+    // Fall back to a sibling non-JSON dead-letter file if quarantine setup fails.
+    try {
+      fs.renameSync(msgPath, `${msgPath}.quarantined-${quarantineName}`);
+      clearMessageFailure(msgPath);
+      return true;
+    } catch {
+      // Leave the original message in place if no durable quarantine is possible.
+      return false;
+    }
   }
 }
 
-type TargetSessionCheck = "not-bound" | "match" | "mismatch" | "unavailable";
+export type TargetSessionLookup =
+  | { status: "available"; sessionId: string }
+  | { status: "missing" | "invalid" | "unreadable" };
 
-function checkTargetSession(msg: AgentMailMessage, dirs: Dirs): TargetSessionCheck {
-  if (!msg.targetSessionId) return "not-bound";
-
-  const registrationPath = join(dirs.registry, `${msg.to}.json`);
-  if (!fs.existsSync(registrationPath)) return "mismatch";
+/** Read the target registration once for all inbox producers and consumers. */
+export function lookupTargetSession(to: string, registryDir: string): TargetSessionLookup {
+  const registrationPath = join(registryDir, `${to}.json`);
+  if (!fs.existsSync(registrationPath)) return { status: "missing" };
   try {
     const registration = JSON.parse(fs.readFileSync(registrationPath, "utf-8")) as Partial<AgentRegistration>;
-    return registration.sessionId === msg.targetSessionId ? "match" : "mismatch";
+    if (typeof registration.sessionId !== "string" || registration.sessionId.length === 0) {
+      return { status: "invalid" };
+    }
+    return { status: "available", sessionId: registration.sessionId };
   } catch {
-    return "unavailable";
+    return { status: "unreadable" };
   }
+}
+
+function checkTargetSession(msg: AgentMailMessage, dirs: Dirs): "not-bound" | "match" | "mismatch" | "unavailable" {
+  if (!msg.targetSessionId) return "not-bound";
+  const target = lookupTargetSession(msg.to, dirs.registry);
+  if (target.status === "available") {
+    return target.sessionId === msg.targetSessionId ? "match" : "mismatch";
+  }
+  return target.status === "missing" ? "mismatch" : "unavailable";
 }
 
 export function processAllPendingMessages(
@@ -1052,6 +1091,13 @@ export function processAllPendingMessages(
     const inbox = getMyInbox(state, dirs);
     if (!fs.existsSync(inbox)) return;
 
+    const blockedPath = blockedInboxMessages.get(state);
+    if (blockedPath) {
+      if (fs.existsSync(blockedPath)) return;
+      clearMessageFailure(blockedPath);
+      blockedInboxMessages.delete(state);
+    }
+
     let files: string[];
     try {
       files = fs.readdirSync(inbox).filter(f => f.endsWith(".json")).sort();
@@ -1071,7 +1117,9 @@ export function processAllPendingMessages(
         });
         const targetSession = checkTargetSession(msg, dirs);
         if (targetSession === "mismatch") {
-          quarantineMessage(msgPath, "target session is no longer active for this agent name");
+          if (!quarantineMessage(msgPath, "target session is no longer active for this agent name")) {
+            throw new Error("target session mismatch could not be quarantined");
+          }
           continue;
         }
         if (targetSession === "unavailable") {
@@ -1083,10 +1131,12 @@ export function processAllPendingMessages(
       } catch (error) {
         const attempts = recordMessageFailure(msgPath);
         if (attempts >= MESSAGE_RETRY_LIMIT) {
-          quarantineMessage(
-            msgPath,
-            error instanceof Error ? error.message : "message read or delivery failed",
-          );
+          const reason = error instanceof Error ? error.message : "message read or delivery failed";
+          if (!quarantineMessage(msgPath, reason)) {
+            blockedInboxMessages.set(state, msgPath);
+            console.error(`Pi Messenger inbox paused: could not quarantine ${msgPath}: ${reason}`);
+            return;
+          }
         }
         // Retain failures below the limit so a transient read/delivery error can recover.
       }
@@ -1113,17 +1163,11 @@ export function sendMessageToAgent(
   const targetInbox = join(dirs.inbox, to);
   ensureDirSync(targetInbox);
 
-  let targetSessionId: string | undefined;
-  try {
-    const targetRegistration = JSON.parse(
-      fs.readFileSync(join(dirs.registry, `${to}.json`), "utf-8"),
-    ) as Partial<AgentRegistration>;
-    if (typeof targetRegistration.sessionId === "string") {
-      targetSessionId = targetRegistration.sessionId;
-    }
-  } catch {
-    // Keep compatibility with callers that queue mail before registration exists.
-  }
+  const targetSession = lookupTargetSession(to, dirs.registry);
+  const targetSessionId = targetSession.status === "available"
+    ? targetSession.sessionId
+    : undefined;
+  // Keep compatibility with callers that queue mail before registration exists.
 
   const msg: AgentMailMessage = {
     id: randomUUID(),

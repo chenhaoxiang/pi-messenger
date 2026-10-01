@@ -71,7 +71,15 @@ vi.mock("../../lib.ts", async () => {
 function createTestCwd(): string {
   const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "pi-messenger-lobby-test-"));
   fs.mkdirSync(path.join(cwd, ".pi", "messenger", "crew"), { recursive: true });
+  fs.mkdirSync(path.join(cwd, ".pi", "messenger", "registry"), { recursive: true });
   return cwd;
+}
+
+function registerWorker(cwd: string, name: string): void {
+  fs.writeFileSync(
+    path.join(cwd, ".pi", "messenger", "registry", `${name}.json`),
+    JSON.stringify({ name, sessionId: "session-1" }),
+  );
 }
 
 describe("lobby workers", () => {
@@ -205,6 +213,7 @@ describe("lobby workers", () => {
     const worker = lobby.spawnLobbyWorker(cwd)!;
     expect(worker.assignedTaskId).toBeNull();
 
+    registerWorker(cwd, worker.name);
     const assigned = lobby.assignTaskToLobbyWorker(worker, "task-3", "# Task 3\nDo stuff", inboxDir);
     expect(assigned).toBe(true);
     expect(worker.assignedTaskId).toBe("task-3");
@@ -213,8 +222,9 @@ describe("lobby workers", () => {
     const inbox = path.join(inboxDir, worker.name);
     const messageFile = fs.readdirSync(inbox).find(file => file.endsWith(".json"));
     expect(messageFile).toBeTruthy();
-    const message = JSON.parse(fs.readFileSync(path.join(inbox, messageFile!), "utf-8")) as { text: string };
+    const message = JSON.parse(fs.readFileSync(path.join(inbox, messageFile!), "utf-8")) as { text: string; targetSessionId: string };
     expect(message.text).toContain("Follow the assignment below");
+    expect(message.targetSessionId).toBe("session-1");
     expect(message.text).not.toContain("reserving files, implementing, testing, committing");
   });
 
@@ -226,6 +236,16 @@ describe("lobby workers", () => {
     expect(worker.assignedTaskId).toBe("task-1");
   });
 
+  it("fails closed when the target registration has no session identity", () => {
+    const cwd = createTestCwd();
+    const inboxDir = path.join(cwd, ".pi", "messenger", "inbox");
+    const worker = lobby.spawnLobbyWorker(cwd)!;
+
+    expect(lobby.assignTaskToLobbyWorker(worker, "task-unbound", "prompt", inboxDir)).toBe(false);
+    expect(fs.existsSync(path.join(inboxDir, worker.name))).toBe(true);
+    expect(fs.readdirSync(path.join(inboxDir, worker.name))).toEqual([]);
+  });
+
   it("manages keep-alive file lifecycle on spawn, assignment, direct assignment, and shutdown", async () => {
     const cwd = createTestCwd();
     const inboxDir = path.join(cwd, ".pi", "messenger", "inbox");
@@ -234,6 +254,7 @@ describe("lobby workers", () => {
     expect(worker.aliveFile).toBeTruthy();
     expect(fs.existsSync(worker.aliveFile!)).toBe(true);
 
+    registerWorker(cwd, worker.name);
     const assigned = lobby.assignTaskToLobbyWorker(worker, "task-keepalive", "# Task\nDo work", inboxDir);
     expect(assigned).toBe(true);
     expect(fs.existsSync(worker.aliveFile!)).toBe(false);

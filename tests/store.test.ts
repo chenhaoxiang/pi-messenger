@@ -8,6 +8,8 @@ import {
   invalidateAgentsCache,
   processAllPendingMessages,
   register,
+  updateRegistration,
+  flushActivityToRegistry,
   sendMessageToAgent,
 } from "../store.ts";
 
@@ -265,6 +267,48 @@ describe("store.processAllPendingMessages", () => {
     expect(reasonFile).toBeDefined();
     expect(JSON.parse(fs.readFileSync(path.join(quarantine, reasonFile!), "utf-8"))).toMatchObject({
       reason: "permanent failure",
+    });
+  });
+
+  it("bounds retries in memory when the retry sidecar cannot be written", () => {
+    const root = createTempRoot();
+    const dirs = createDirs(root);
+    const inbox = path.join(dirs.inbox, "Self");
+    fs.mkdirSync(inbox, { recursive: true });
+    fs.writeFileSync(path.join(inbox, "sidecar.json"), JSON.stringify({ from: "Peer", to: "Self", text: "Retry" }));
+    fs.mkdirSync(path.join(inbox, "sidecar.json.retry"));
+    const state = { agentName: "Self", registered: true } as MessengerState;
+
+    for (let attempt = 0; attempt < 3; attempt++) {
+      processAllPendingMessages(state, dirs, () => { throw new Error("sidecar unavailable"); });
+    }
+
+    expect(fs.existsSync(path.join(inbox, "sidecar.json"))).toBe(false);
+    expect(fs.readdirSync(path.join(inbox, "quarantine"))).toHaveLength(2);
+  });
+
+  it("keeps registration JSON valid across create, update, and activity flush", () => {
+    const root = createTempRoot();
+    const dirs = createDirs(root);
+    const state = createRegisterState(root);
+    const ctx = {
+      cwd: root,
+      hasUI: false,
+      model: { id: "test-model" },
+      sessionManager: { getSessionId: () => "session-1" },
+    } as any;
+
+    expect(register(state, dirs, ctx)).toBe(true);
+    state.session.toolCalls = 2;
+    updateRegistration(state, dirs, ctx);
+    state.session.tokens = 7;
+    flushActivityToRegistry(state, dirs, ctx);
+
+    expect(fs.readdirSync(dirs.registry)).toEqual(["Self.json"]);
+    expect(fs.readdirSync(dirs.registry).filter(file => file.includes(".tmp-"))).toEqual([]);
+    expect(JSON.parse(fs.readFileSync(path.join(dirs.registry, "Self.json"), "utf-8"))).toMatchObject({
+      sessionId: "session-1",
+      session: { toolCalls: 2, tokens: 7 },
     });
   });
 

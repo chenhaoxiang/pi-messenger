@@ -13,7 +13,7 @@ import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { randomUUID } from "node:crypto";
 import { generateMemorableName } from "../lib.ts";
-import { writeInboxMessageAtomically } from "../store.ts";
+import { writeTargetInboxMessageAtomically } from "../store.ts";
 import { resolveThinking, modelHasThinkingSuffix, pushModelArgs, getPiCommand, resolveModel } from "./agents.ts";
 import { discoverCrewAgents } from "./utils/discover.ts";
 import { loadCrewConfig, type CrewConfig } from "./utils/config.ts";
@@ -225,6 +225,7 @@ export function assignTaskToLobbyWorker(
   taskId: string,
   taskPrompt: string,
   inboxDir: string,
+  registryDir: string = path.join(path.dirname(inboxDir), "registry"),
 ): boolean {
   if (worker.assignedTaskId) return false;
   if (worker.proc.exitCode !== null) return false;
@@ -254,7 +255,12 @@ ${taskPrompt}`,
     try { fs.unlinkSync(aliveFile); } catch {}
   }
   try {
-    writeInboxMessageAtomically(msgFile, msg);
+    if (!writeTargetInboxMessageAtomically(msgFile, msg, worker.name, { registry: registryDir })) {
+      if (aliveFile) {
+        try { fs.writeFileSync(aliveFile, "", { mode: 0o600 }); } catch {}
+      }
+      return false;
+    }
   } catch {
     if (aliveFile) {
       try { fs.writeFileSync(aliveFile, "", { mode: 0o600 }); } catch {}
