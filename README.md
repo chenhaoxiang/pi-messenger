@@ -1,5 +1,7 @@
 # Pi Messenger
 
+English | [中文](README.zh-CN.md)
+
 File-based coordination for multiple Pi sessions sharing a project or workspace. This repository is the maintained `chenhaoxiang/pi-messenger` fork.
 
 > Fork repository: <https://github.com/chenhaoxiang/pi-messenger>
