@@ -1,17 +1,17 @@
 {
   "name": "pi-messenger",
-  "version": "0.15.2",
+  "version": "0.15.2-fork.1",
   "description": "Inter-agent messaging and file reservation system for pi coding agent",
   "type": "module",
   "author": "Nico Bailon",
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/nicobailon/pi-messenger.git"
+    "url": "git+https://github.com/chenhaoxiang/pi-messenger.git"
   },
-  "homepage": "https://github.com/nicobailon/pi-messenger#readme",
+  "homepage": "https://github.com/chenhaoxiang/pi-messenger#readme",
   "bugs": {
-    "url": "https://github.com/nicobailon/pi-messenger/issues"
+    "url": "https://github.com/chenhaoxiang/pi-messenger/issues"
   },
   "keywords": [
     "pi-package",
@@ -34,6 +34,8 @@
     "crew/**",
     "skills/**",
     "README.md",
+    "README.zh-CN.md",
+    "docs/releasing.md",
     "CHANGELOG.md"
   ],
   "scripts": {

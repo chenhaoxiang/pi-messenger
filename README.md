@@ -8,6 +8,22 @@ File-based coordination for multiple Pi sessions sharing a project or workspace.
 >
 > Use **pi-messenger** for shared presence, file reservations, activity feed, Crew task orchestration, and optional Team profiles. Use [pi-intercom](https://github.com/chenhaoxiang/pi-intercom) for targeted 1:1 conversations.
 
+## Releases and branch policy
+
+The maintained release is **0.15.2-fork.1**, based on community **0.15.2**. Fork releases use `<community-version>-fork.<revision>`; the fork revision increases without pretending to be a new upstream release.
+
+- `main`: our maintained integration and release branch, including fork fixes.
+- `upstream-main`: an exact mirror of the community's `main`, with no fork commits. Never install from this branch.
+- Changes enter `main` through reviewed pull requests; existing branches and history are retained.
+
+Install a reproducible release:
+
+```bash
+pi install git:github.com/chenhaoxiang/pi-messenger@v0.15.2-fork.1
+```
+
+[GitHub Releases](https://github.com/chenhaoxiang/pi-messenger/releases) include the installable package tarball, a provenance manifest, and `SHA256SUMS`. These GitHub releases are not npm publications under the upstream author's namespace. See [release maintenance](docs/releasing.md) for asset installation and future releases.
+
 ## Install this fork
 
 ```bash
