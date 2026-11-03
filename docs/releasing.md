@@ -22,7 +22,7 @@ Applies only to chenhaoxiang/pi-messenger. The community project remains [nicoba
 
 ## Baseline for this release
 
-Version **0.15.2-fork.1** retains the maintained integration of community 0.15.2 and our reliability changes: durable processed markers, payload fingerprints, scoped/session-bound inbox processing, stale lock recovery and bounded dedupe. Current community main is already an ancestor; no runtime behavior changes are made by this release maintenance.
+Version **0.15.2-fork.2** retains the maintained integration of community 0.15.2 and our reliability changes: durable processed markers, payload fingerprints, scoped/session-bound inbox processing, stale lock recovery and bounded dedupe. It also incorporates the community main fixes for session shutdown cleanup, headless status rendering and Windows Pi relaunch. Previous fork.1 remains available for rollback.
 
 ## Publish every version
 
