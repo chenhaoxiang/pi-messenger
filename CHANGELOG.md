@@ -2,6 +2,17 @@
 
 ## [Unreleased]
 
+## [0.15.2-fork.2] - 2026-11-03
+
+- Sync community main through `a704e7202fa5a7d9fa4b95e8c87cf46950bc3444`, retaining the fork's durable marker, fingerprint, scoped inbox, stale-lock recovery and bounded dedupe guarantees.
+- Include community fixes for stale-context session shutdown cleanup, theme-less status rendering, and Windows Crew worker relaunch.
+
+
+### Fixed
+- Finish session shutdown cleanup when the host hands over an already-stale context, so lobby workers, the status heartbeat, and the agent registration no longer leak into the next session, fixing #39. Thanks to [@wu546526](https://github.com/wu546526) for #39.
+- Render the status line without colors when the host UI has no theme, so headless and web-panel sessions no longer crash on every turn, fixing #38. Thanks to [@wu546526](https://github.com/wu546526) for #38.
+- Start Crew planners, workers, and lobby workers on Windows by relaunching the running Pi directly instead of `pi.cmd`, which Node refuses to spawn without a shell (`spawn EINVAL`), fixing #37. Thanks to [@Cinnamobot](https://github.com/Cinnamobot) for #37.
+
 ## [0.15.2] - 2026-08-27
 
 ### Highlights

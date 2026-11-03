@@ -1,6 +1,6 @@
 {
   "name": "pi-messenger",
-  "version": "0.15.2-fork.1",
+  "version": "0.15.2-fork.2",
   "description": "Inter-agent messaging and file reservation system for pi coding agent",
   "type": "module",
   "author": "Nico Bailon",
